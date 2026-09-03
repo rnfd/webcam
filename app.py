@@ -257,7 +257,7 @@ class Recorder:
             # retry a few times in case the composite is momentarily unavailable
             for attempt in range(4):
                 p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-                time.sleep(1.2)
+                time.sleep(0.6)
                 if p.poll() is None:              # still running -> connected OK
                     self.proc = p; self.file = path; self.started = time.time()
                     self._arm_cap()               # auto-stop after MAX_REC_SECONDS
@@ -462,10 +462,10 @@ def _tg_command_loop():
     offset = 0
     while True:
         try:
-            q = urllib.parse.urlencode({"offset": offset, "timeout": 25,
+            q = urllib.parse.urlencode({"offset": offset, "timeout": 10,
                                         "allowed_updates": '["message"]'})
             url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?{q}"
-            data = _json.loads(urllib.request.urlopen(url, timeout=40).read().decode())
+            data = _json.loads(urllib.request.urlopen(url, timeout=25).read().decode())
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
                 m = upd.get("message") or {}
@@ -473,6 +473,8 @@ def _tg_command_loop():
                     continue                                  # owner only
                 text = (m.get("text") or "").strip().lower().split("@")[0]
                 if text:
+                    age = time.time() - m.get("date", time.time())
+                    print(f"telegram: got {text!r} {age:.1f}s after it was sent")
                     threading.Thread(target=_tg_handle, args=(text,), daemon=True).start()
         except Exception as e:
             print("telegram: poll error:", e)
