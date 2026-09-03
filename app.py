@@ -431,13 +431,46 @@ def _tg_set_commands():
     try: _tg_api("setMyCommands", fields={"commands": _json.dumps(cmds)})
     except Exception: pass
 
+def _snapshot():
+    """Grab one frame from the composite (both cameras) as a JPEG; return path."""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".jpg", prefix="snap_"); os.close(fd)
+    try:
+        subprocess.run([FFMPEG, "-loglevel", "error", "-rtsp_transport", "tcp",
+                        "-i", RTSP_COMPOSITE, "-frames:v", "1", "-q:v", "3", "-y", path],
+                       check=True, timeout=15)
+        if os.path.getsize(path) > 0:
+            return path
+    except Exception as e:
+        print("snapshot failed:", e)
+    try: os.remove(path)
+    except OSError: pass
+    return None
+
+def _tg_snap_reply(caption):
+    """Send the current composite frame as a photo, captioned; fall back to text."""
+    snap = _snapshot()
+    if not snap:
+        _tg_reply(caption); return
+    try:
+        boundary, body = _tg_multipart({"chat_id": TG_CHAT, "caption": caption},
+                                       "photo", snap, ctype="image/jpeg")
+        r = _tg_api("sendPhoto", boundary=boundary, body=body)
+        if not r.get("ok"): _tg_reply(caption)
+    except Exception as e:
+        print("telegram: photo failed:", e); _tg_reply(caption)
+    finally:
+        try: os.remove(snap)
+        except OSError: pass
+
 def _tg_handle(text):
-    """Run one command; may block (start/stop), so it runs off the poll loop."""
+    """Run one command; may block (start/stop/snapshot), so it runs off the poll loop."""
     if text in ("/record", "/rec"):
         st = REC.start()
-        _tg_reply("🔴 Recording started." if st.get("recording")
-                  else "⚠️ Could not start (composite unavailable)."
-                       if st.get("error") else "Already recording.")
+        cap = ("🔴 Recording started." if st.get("recording")
+               else "⚠️ Could not start (composite unavailable)."
+                    if st.get("error") else "Already recording.")
+        _tg_snap_reply(cap)
     elif text == "/stop":
         if REC.status().get("recording"):
             _tg_reply("⏹ Stopping…")              # instant ack, then finalize/upload
@@ -446,10 +479,8 @@ def _tg_handle(text):
             _tg_reply("Not recording.")
     elif text == "/status":
         st = REC.status()
-        if st.get("recording"):
-            e = st["elapsed"]; _tg_reply(f"🔴 Recording  {e//60:02d}:{e%60:02d}")
-        else:
-            _tg_reply("⏹ Idle")
+        cap = (f"🔴 Recording  {_dur(st['elapsed'])}" if st.get("recording") else "⏹ Idle")
+        _tg_snap_reply(cap)
     elif text in ("/start", "/help"):
         _tg_reply("Camera bot:\n/record — start\n/stop — stop\n/status — status")
 
