@@ -1,0 +1,40 @@
+# Reverse proxy so the cameras are reachable at cam.axonpipe.com with no port.
+# Fronts the app (page + record API) and MediaMTX (WebRTC signaling) on one origin.
+# The WebRTC MEDIA channel (UDP/TCP 8189) is NOT proxied — it stays a direct port,
+# reachable over the VPN. Run the app with WHEP_URL=/composite/whep so the page
+# uses same-origin signaling through this proxy.
+#
+# --- run it (needs privilege to bind 80/443) ---
+#   sudo CF_API_TOKEN=... caddy run --config Caddyfile
+# or give the caddy binary the capability once:
+#   sudo setcap 'cap_net_bind_service=+ep' $(readlink -f "$(command -v caddy)")
+#   caddy run --config Caddyfile
+
+# ============ PLAIN HTTP on port 80  ->  http://cam.axonpipe.com ============
+# Simplest. No certificate. Good for VPN-only use.
+http://cam.axonpipe.com {
+	handle /composite/* {
+		reverse_proxy 127.0.0.1:8889
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8088
+	}
+}
+
+# ============ HTTPS on 443  ->  https://cam.axonpipe.com  (recommended for iOS) ============
+# Needs a caddy build with the Cloudflare DNS plugin and a token, because the host
+# is a private IP behind the VPN (DNS-01, no public exposure):
+#   nix run 'nixpkgs#caddy.withPlugins' --override-input ... # or xcaddy build --with github.com/caddy-dns/cloudflare
+#   export CF_API_TOKEN=<Cloudflare token with Zone.DNS:Edit on axonpipe.com>
+#
+# cam.axonpipe.com {
+# 	tls {
+# 		dns cloudflare {env.CF_API_TOKEN}
+# 	}
+# 	handle /composite/* {
+# 		reverse_proxy 127.0.0.1:8889
+# 	}
+# 	handle {
+# 		reverse_proxy 127.0.0.1:8088
+# 	}
+# }

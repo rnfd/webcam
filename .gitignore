@@ -1,0 +1,17 @@
+# recordings and any captured media (private, large)
+recordings/
+*.mkv
+*.mp4
+*.jpg
+*.jpeg
+*.png
+
+# secrets (kept in /etc/cams/, never in the repo)
+*.env
+rclone.conf
+auto.crt
+auto.key
+
+# python
+__pycache__/
+*.pyc

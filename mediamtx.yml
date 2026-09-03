@@ -1,0 +1,41 @@
+# MediaMTX: always-on composite (both cameras stacked, audio mixed) over WebRTC.
+logLevel: info
+readTimeout: 15s
+writeTimeout: 15s
+
+rtsp: yes
+rtspAddress: :8554
+rtspTransports: [tcp]
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcAdditionalHosts: [192.168.1.250]
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+
+hls: no
+rtmp: no
+srt: no
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+
+paths:
+  composite:
+    # always-on compositor: starts with the path, restarts on failure
+    runOnInit: >
+      /nix/store/a2qfg58bz9c68lqgr4id8g2vvqdagman-ffmpeg-9.0.1-bin/bin/ffmpeg -loglevel warning -nostdin -fflags +genpts
+      -rtsp_transport tcp -i rtsp://admin:@192.168.1.146:554/h264Preview_01_sub
+      -rtsp_transport tcp -i rtsp://admin:@192.168.1.185:554/h264Preview_01_sub
+      -filter_complex "[0:v]scale=640:-2,setsar=1[v0];[1:v]scale=640:-2,setsar=1[v1];[v0][v1]vstack=inputs=2[v];[0:a][1:a]amix=inputs=2:normalize=0,aresample=async=1:first_pts=0[a]"
+      -map "[v]" -map "[a]"
+      -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 30
+      -c:a libopus -b:a 64k -ac 2
+      -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/composite
+    runOnInitRestart: yes
