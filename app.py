@@ -80,6 +80,16 @@ for _it in os.environ.get("CAM_IPS", "").split(","):
     _ip, _, _nm = _it.strip().partition("=")
     if _ip: CAMS.append((_ip, _nm or _ip))
 MOTION_COOLDOWN = int(os.environ.get("MOTION_COOLDOWN", "30"))  # seconds per event
+PLAYBACK   = os.environ.get("PLAYBACK_URL", "http://localhost:9996")  # MediaMTX playback
+MOTION_PRE  = int(os.environ.get("MOTION_PRE", "3"))   # seconds before detection
+MOTION_POST = int(os.environ.get("MOTION_POST", "3"))  # seconds after detection
+
+def _fmt_size(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024: return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 def _tg_api(method, boundary=None, body=None, fields=None):
     import urllib.request, urllib.parse
@@ -125,9 +135,10 @@ def _tg_edit(msg_id, text):
     except Exception:
         pass
 
-def _tg_finalize(msg_id, base, elapsed, link):
-    text = (f"📹 {base}  ({_dur(elapsed)})\n✅ Uploaded\n{link}" if link
-            else f"📹 {base}  ({_dur(elapsed)})\n✅ Saved to Drive (link unavailable).")
+def _tg_finalize(msg_id, base, elapsed, link, size=None):
+    sz = f" · {_fmt_size(size)}" if size else ""
+    text = (f"📹 {base}  ({_dur(elapsed)}{sz})\n✅ Uploaded\n{link}" if link
+            else f"📹 {base}  ({_dur(elapsed)}{sz})\n✅ Saved to Drive (link unavailable).")
     _tg_api("editMessageText", fields={"chat_id": TG_CHAT, "message_id": msg_id,
             "text": text})
     print("telegram: finalized with link" if link else "telegram: finalized")
@@ -211,13 +222,14 @@ def _post_record(mkv_path, elapsed):
         print("post-record: remux failed:", e); return
     try:
         base = os.path.basename(mp4)
+        size = os.path.getsize(mp4)
         tg, gd = _tg_enabled(), _gdrive_enabled()
         msg_id = _tg_send_initial(base, elapsed) if tg else None
         prog = _Prog(msg_id, base, elapsed) if (tg and msg_id) else None
         link = _gdrive_upload(mp4, on_progress=prog) if gd else None
         if tg:
             try:
-                if msg_id: _tg_finalize(msg_id, base, elapsed, link)
+                if msg_id: _tg_finalize(msg_id, base, elapsed, link, size)
                 else:      _tg_send_link(base, elapsed, link)
             except Exception as e: print("telegram: failed:", e)
     finally:
@@ -580,25 +592,66 @@ def _cam_snapshot(ip):
 
 _MOTION_LABEL = {"pet": "🐕 Pet", "person": "🧍 Person", "motion": "🟡 Motion"}
 
-def _notify_motion(ip, name, ev):
-    cap = f"{_MOTION_LABEL.get(ev, ev)} detected · {name}"
-    img = _cam_snapshot(ip)
-    if img:
-        import tempfile
-        fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
-        with open(path, "wb") as f: f.write(img)
-        try:
-            boundary, body = _tg_multipart({"chat_id": TG_CHAT, "caption": cap},
-                                           "photo", path, ctype="image/jpeg")
-            _tg_api("sendPhoto", boundary=boundary, body=body)
-        except Exception as e:
-            print("motion: photo failed:", e); _tg_reply(cap)
-        finally:
-            try: os.remove(path)
+def _playback_clip(path, det_epoch):
+    """Fetch [det-PRE, det+POST] from MediaMTX playback, remux to mp4+aac."""
+    import urllib.request, urllib.parse, datetime, tempfile
+    start = datetime.datetime.fromtimestamp(det_epoch - MOTION_PRE, datetime.timezone.utc)
+    url = PLAYBACK + "/get?" + urllib.parse.urlencode(
+        {"path": path, "start": start.isoformat().replace("+00:00", "Z"),
+         "duration": MOTION_PRE + MOTION_POST})
+    fd, raw = tempfile.mkstemp(suffix=".mp4"); os.close(fd)
+    fd, out = tempfile.mkstemp(suffix=".mp4"); os.close(fd)
+    try:
+        with open(raw, "wb") as f: f.write(urllib.request.urlopen(url, timeout=30).read())
+        subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-i", raw,
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
+                        "-movflags", "+faststart", out], check=True, timeout=60)
+        os.remove(raw)
+        return out
+    except Exception as e:
+        print("motion: clip fetch failed:", e)
+        for p in (raw, out):
+            try: os.path.exists(p) and os.remove(p)
             except OSError: pass
-    else:
-        _tg_reply(cap)
-    print("motion:", cap)
+        return None
+
+def _tg_send_video(path, caption):
+    boundary, body = _tg_multipart({"chat_id": TG_CHAT, "caption": caption,
+                                    "supports_streaming": "true"}, "video", path, ctype="video/mp4")
+    return _tg_api("sendVideo", boundary=boundary, body=body).get("ok")
+
+def _tg_send_photo(img_bytes, caption):
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+    with open(path, "wb") as f: f.write(img_bytes)
+    try:
+        boundary, body = _tg_multipart({"chat_id": TG_CHAT, "caption": caption},
+                                       "photo", path, ctype="image/jpeg")
+        return _tg_api("sendPhoto", boundary=boundary, body=body).get("ok")
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
+def _notify_motion(ip, name, ev, path, det_epoch):
+    label = _MOTION_LABEL.get(ev, ev)
+    time.sleep(MOTION_POST + 1.5)              # wait for the +POST seconds to record
+    clip = _playback_clip(path, det_epoch)
+    if clip:
+        try:
+            cap = f"{label} detected · {name}  ({_fmt_size(os.path.getsize(clip))})"
+            if not _tg_send_video(clip, cap):
+                _tg_reply(cap)
+        except Exception as e:
+            print("motion: video send failed:", e)
+        finally:
+            try: os.remove(clip)
+            except OSError: pass
+    else:                                       # fall back to a snapshot
+        cap = f"{label} detected · {name}"
+        img = _cam_snapshot(ip)
+        if img: _tg_send_photo(img, cap)
+        else:   _tg_reply(cap)
+    print("motion:", label, name)
 
 def _motion_watch():
     """While recording, alert Telegram on camera detections (pet/person/motion)."""
@@ -607,12 +660,15 @@ def _motion_watch():
     while True:
         try:
             if TG_TOKEN and TG_CHAT and REC.status().get("recording"):
-                for ip, name in CAMS:
+                for i, (ip, name) in enumerate(CAMS):
+                    campath = f"cam{i+1}"
                     for ev in _cam_detections(ip):
                         key = (ip, ev)
-                        if time.time() - last.get(key, 0) > MOTION_COOLDOWN:
-                            last[key] = time.time()
-                            threading.Thread(target=_notify_motion, args=(ip, name, ev),
+                        now = time.time()
+                        if now - last.get(key, 0) > MOTION_COOLDOWN:
+                            last[key] = now
+                            threading.Thread(target=_notify_motion,
+                                             args=(ip, name, ev, campath, now),
                                              daemon=True).start()
             time.sleep(2)
         except Exception as e:

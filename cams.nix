@@ -53,6 +53,13 @@ let
     hls: no
     rtmp: no
     srt: no
+    # rolling per-camera buffer for motion clips, served via the playback API
+    playback: yes
+    playbackAddress: :9996
+    recordPath: /var/lib/cams-mediamtx/rec/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    recordSegmentDuration: 60s
+    recordDeleteAfter: 10m
     authMethod: internal
     authInternalUsers:
       - user: any
@@ -77,6 +84,7 @@ let
           -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/composite
         runOnInitRestart: yes
       cam1:
+        record: yes
         runOnInit: >
           ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin
           -rtsp_transport tcp -i rtsp://${cred}${cam1}:554/${rtspPath}
@@ -84,6 +92,7 @@ let
           -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/cam1
         runOnInitRestart: yes
       cam2:
+        record: yes
         runOnInit: >
           ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin
           -rtsp_transport tcp -i rtsp://${cred}${cam2}:554/${rtspPath}
@@ -106,6 +115,7 @@ in {
       DynamicUser = true;
       RuntimeDirectory = "cams-mediamtx";       # writable cwd for the MoQ cert
       WorkingDirectory = "/run/cams-mediamtx";
+      StateDirectory = "cams-mediamtx";         # -> /var/lib/cams-mediamtx (rec buffer)
     };
   };
 
