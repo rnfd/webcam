@@ -76,6 +76,20 @@ let
           -muxdelay 0 -muxpreload 0
           -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/composite
         runOnInitRestart: yes
+      cam1:
+        runOnInit: >
+          ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin
+          -rtsp_transport tcp -i rtsp://${cred}${cam1}:554/${rtspPath}
+          -map 0 -c:v copy -c:a libopus -b:a 64k -ac 2
+          -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/cam1
+        runOnInitRestart: yes
+      cam2:
+        runOnInit: >
+          ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin
+          -rtsp_transport tcp -i rtsp://${cred}${cam2}:554/${rtspPath}
+          -map 0 -c:v copy -c:a libopus -b:a 64k -ac 2
+          -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/cam2
+        runOnInitRestart: yes
   '';
 
   appPy = ./app.py;   # copied into the store on rebuild
@@ -147,6 +161,14 @@ in {
         proxyWebsockets = true;
       };
       locations."/composite/" = {
+        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
+        proxyWebsockets = true;
+      };
+      locations."/cam1/" = {
+        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
+        proxyWebsockets = true;
+      };
+      locations."/cam2/" = {
         proxyPass = "http://127.0.0.1:${toString webrtcPort}";
         proxyWebsockets = true;
       };

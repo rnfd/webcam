@@ -303,8 +303,14 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}
 html,body{margin:0;height:100%;background:#000;color:#eee;font:15px/1.4 -apple-system,system-ui,sans-serif}
-.stage{position:fixed;inset:0 0 64px 0;display:flex;align-items:center;justify-content:center}
-video{max-width:100%;max-height:100%;width:auto;height:auto;background:#000}
+.stage{position:fixed;inset:0 0 64px 0;display:flex;flex-direction:column;gap:6px;
+  align-items:center;justify-content:center;padding:6px;overflow:auto}
+.cam{position:relative;max-width:100%;max-height:calc(50% - 6px);display:flex}
+.cam video{max-width:100%;max-height:100%;width:auto;background:#000;border-radius:6px}
+.cam b{position:absolute;top:6px;left:8px;padding:1px 7px;border-radius:4px;
+  background:rgba(0,0,0,.55);font-size:12px;font-weight:600}
+@media (min-aspect-ratio:1/1){ .stage{flex-direction:row}
+  .cam{max-width:calc(50% - 6px);max-height:100%} }
 .bar{position:fixed;left:0;right:0;bottom:0;height:64px;display:flex;gap:12px;align-items:center;
   justify-content:center;background:#0b0b0b;border-top:1px solid #222;padding:0 12px;padding-bottom:env(safe-area-inset-bottom)}
 #rec{font:600 16px system-ui;color:#fff;background:#dc2626;border:0;border-radius:999px;padding:12px 22px;cursor:pointer;min-width:150px}
@@ -317,58 +323,55 @@ video{max-width:100%;max-height:100%;width:auto;height:auto;background:#000}
 .hint{color:#888;font-size:13px;max-width:22em}
 #err{position:fixed;left:8px;right:8px;bottom:70px;color:#f87171;font-size:12px;text-align:center}
 </style></head><body>
-<div class="stage"><video id="v" playsinline webkit-playsinline autoplay controls muted></video></div>
+<div class="stage">
+  <div class="cam"><b>Camera 1</b><video id="v1" playsinline webkit-playsinline autoplay controls muted></video></div>
+  <div class="cam"><b>Camera 2</b><video id="v2" playsinline webkit-playsinline autoplay controls muted></video></div>
+</div>
 <div class="bar"><button id="rec">● Record</button><span id="stat">—</span></div>
 <div class="gate" id="gate">
   <div style="font-size:20px;font-weight:700">Cameras</div>
   <button class="play" id="go">▶  Play with sound</button>
-  <div class="hint">Two cameras stacked, audio mixed, near real-time. Tap to start.</div>
+  <div class="hint">Two independent camera feeds, near real-time. Tap to start.</div>
   <div class="hint" id="cstat" style="color:#4ade80">starting…</div>
 </div>
 <div id="err"></div>
 <script>
-var v=document.getElementById('v'),gate=document.getElementById('gate'),go=document.getElementById('go'),
+var v1=document.getElementById('v1'),v2=document.getElementById('v2'),
+    gate=document.getElementById('gate'),go=document.getElementById('go'),
     rec=document.getElementById('rec'),stat=document.getElementById('stat'),err=document.getElementById('err'),
-    cstat=document.getElementById('cstat'),
-    WHEP=__WHEP_JS__,busy=false,pc=null,haveTrack=false;
+    cstat=document.getElementById('cstat'),WHEP_BASE=__WHEP_BASE__,busy=false,ok={};
 function say(m){ cstat.textContent=m; }
 if(!window.RTCPeerConnection){ say('this browser has no WebRTC support'); }
-async function connect(){
-  haveTrack=false;
-  try{
-    say('connecting…');
-    pc=new RTCPeerConnection({iceServers:[]});
-    pc.addTransceiver('video',{direction:'recvonly'});
-    pc.addTransceiver('audio',{direction:'recvonly'});
-    pc.ontrack=function(e){ haveTrack=true; try{e.receiver.playoutDelayHint=0;}catch(_){} if(v.srcObject!==e.streams[0]) v.srcObject=e.streams[0]; say('stream received — tap play'); v.play().catch(function(){}); };
-    pc.oniceconnectionstatechange=function(){ say('ice: '+pc.iceConnectionState); };
-    pc.onconnectionstatechange=function(){
-      if(pc.connectionState==='connected'){ say('connected'); err.textContent=''; }
-      else if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){
-        say('connection '+pc.connectionState+' — retrying…');
-        setTimeout(function(){ try{pc.close()}catch(e){}; connect(); },1500);
-      }
-    };
-    var offer=await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await new Promise(function(res){                 // wait for ICE gathering (non-trickle)
-      if(pc.iceGatheringState==='complete') return res();
-      var t=setTimeout(res,1500);
-      pc.onicegatheringstatechange=function(){ if(pc.iceGatheringState==='complete'){clearTimeout(t);res();} };
-    });
-    say('signaling…');
-    var resp=await fetch(WHEP,{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
-    if(!resp.ok){ say('signaling failed: HTTP '+resp.status+' @ '+WHEP); return; }
-    var answer=await resp.text();
-    await pc.setRemoteDescription({type:'answer',sdp:answer});
-  }catch(e){ say('error: '+e.message+' ('+WHEP+')'); }
+function setup(video, path){
+  var pc=new RTCPeerConnection({iceServers:[]});
+  pc.addTransceiver('video',{direction:'recvonly'});
+  pc.addTransceiver('audio',{direction:'recvonly'});
+  pc.ontrack=function(e){ try{e.receiver.playoutDelayHint=0;}catch(_){}
+    if(video.srcObject!==e.streams[0]) video.srcObject=e.streams[0]; video.play().catch(function(){}); };
+  pc.onconnectionstatechange=function(){
+    if(pc.connectionState==='connected'){ ok[path]=1; if(ok.cam1&&ok.cam2){say('connected');err.textContent='';} }
+    else if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){
+      ok[path]=0; say(path+' '+pc.connectionState+' — retrying…');
+      setTimeout(function(){ try{pc.close()}catch(e){}; setup(video,path); },1500);
+    }
+  };
+  (async function(){
+    try{
+      var offer=await pc.createOffer(); await pc.setLocalDescription(offer);
+      await new Promise(function(res){ if(pc.iceGatheringState==='complete')return res();
+        var t=setTimeout(res,1500);
+        pc.onicegatheringstatechange=function(){ if(pc.iceGatheringState==='complete'){clearTimeout(t);res();} }; });
+      var url=WHEP_BASE+'/'+path+'/whep';
+      var resp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
+      if(!resp.ok){ say(path+' signaling HTTP '+resp.status); return; }
+      await pc.setRemoteDescription({type:'answer',sdp:await resp.text()});
+    }catch(e){ say(path+' error: '+e.message); }
+  })();
 }
-connect();
-// Tap = unmute + play best-effort, and dismiss the gate no matter what.
+setup(v1,'cam1'); setup(v2,'cam2');
+// Tap = unmute + play both, dismiss the gate no matter what.
 go.onclick=function(){
-  v.muted=false; v.volume=1;
-  var p=v.play();
-  if(p&&p.catch) p.catch(function(){ v.muted=true; v.play().catch(function(){}); }); // fall back to muted autoplay
+  [v1,v2].forEach(function(v){ v.muted=false; v.volume=1; var p=v.play(); if(p&&p.catch)p.catch(function(){}); });
   gate.style.display='none';
 };
 function fmt(s){var m=Math.floor(s/60),ss=s%60;return (m<10?'0':'')+m+':'+(ss<10?'0':'')+ss;}
@@ -386,11 +389,11 @@ rec.onclick=function(){
 };
 poll(); setInterval(poll,2000);
 </script></body></html>"""
-# WHEP signaling URL. Default: talk to MediaMTX directly on its port. Behind a
-# reverse proxy (Caddy on 80/443), set WHEP_URL=/composite/whep for same-origin.
+# WHEP base. Behind the nginx proxy (WHEP_URL set) it's same-origin (""), so
+# paths resolve to /cam1/whep etc. Standalone, target MediaMTX's port directly.
 _whep_env = os.environ.get("WHEP_URL")
-_whep_js = repr(_whep_env) if _whep_env else ("'http://'+location.hostname+':%d/composite/whep'" % WEBRTC_PORT)
-PAGE = PAGE.replace("__WHEP_JS__", _whep_js)
+_whep_base = "''" if _whep_env else ("'http://'+location.hostname+':%d'" % WEBRTC_PORT)
+PAGE = PAGE.replace("__WHEP_BASE__", _whep_base)
 
 class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
@@ -484,29 +487,50 @@ def _tg_handle(text):
     elif text in ("/start", "/help"):
         _tg_reply("Camera bot:\n/record — start\n/stop — stop\n/status — status")
 
-def _tg_command_loop():
-    """Long-poll getUpdates; dispatch each owner command to a worker thread so
-    the loop stays responsive (never blocked by a slow start/stop)."""
+def _tg_get(params, read_timeout):
     import urllib.request, urllib.parse, json as _json
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?{urllib.parse.urlencode(params)}"
+    return _json.loads(urllib.request.urlopen(url, timeout=read_timeout).read().decode())
+
+STALE_SECONDS = 60      # ignore commands older than this (queued during downtime)
+
+def _tg_command_loop():
+    """Long-poll getUpdates; dispatch each owner command to a worker thread.
+    Restart-proof: drains any backlog on startup and skips stale commands, so a
+    service restart never replays queued commands or lags on old ones."""
+    import urllib.error
     print("telegram: command poller started")
     _tg_set_commands()
+    # Drain backlog: confirm everything pending so we start from 'now'.
     offset = 0
+    try:
+        res = _tg_get({"offset": -1, "timeout": 0}, 15).get("result", [])
+        if res: offset = res[-1]["update_id"] + 1
+        print(f"telegram: starting fresh at offset {offset}")
+    except Exception as e:
+        print("telegram: drain failed:", e)
     while True:
         try:
-            q = urllib.parse.urlencode({"offset": offset, "timeout": 10,
-                                        "allowed_updates": '["message"]'})
-            url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?{q}"
-            data = _json.loads(urllib.request.urlopen(url, timeout=25).read().decode())
+            data = _tg_get({"offset": offset, "timeout": 20,
+                            "allowed_updates": '["message"]'}, 35)
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
                 m = upd.get("message") or {}
                 if str(m.get("chat", {}).get("id")) != str(TG_CHAT):
                     continue                                  # owner only
                 text = (m.get("text") or "").strip().lower().split("@")[0]
-                if text:
-                    age = time.time() - m.get("date", time.time())
-                    print(f"telegram: got {text!r} {age:.1f}s after it was sent")
-                    threading.Thread(target=_tg_handle, args=(text,), daemon=True).start()
+                if not text:
+                    continue
+                age = time.time() - m.get("date", time.time())
+                if age > STALE_SECONDS:
+                    print(f"telegram: skipping stale {text!r} ({age:.0f}s old)")
+                    continue
+                threading.Thread(target=_tg_handle, args=(text,), daemon=True).start()
+        except urllib.error.HTTPError as e:
+            # 409 = another getUpdates consumer (e.g. brief overlap on restart)
+            print("telegram: getUpdates conflict, backing off" if e.code == 409
+                  else f"telegram: poll HTTP {e.code}")
+            time.sleep(3)
         except Exception as e:
             print("telegram: poll error:", e)
             time.sleep(3)
