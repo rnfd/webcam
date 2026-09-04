@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""Two Reolink cameras -> WebRTC page (sub-second): stacked video, mixed audio,
-plus server-side record on/off that survives refreshes.
+"""Two Reolink cameras -> WebRTC page (sub-second), each camera independent.
 
-MediaMTX (see mediamtx.yml) composites both cameras into one 'composite' stream
-and serves it over WebRTC. This app serves the mobile page (a WHEP client) and
-the record button. Recording stream-copies MediaMTX's composite (no extra load
-on the cameras, no re-encode).
+MediaMTX (see mediamtx.yml) serves each camera as its own WebRTC stream. This
+app serves the mobile page (two WHEP players), the record button, Telegram
+control, motion alerts, camera health alerts, and delivery to Telegram/Drive.
+Recording, snapshots, and motion are all per-camera, so one camera failing
+never stops the others.
 
 Run:   ./run.sh              (starts MediaMTX + this app)
-Env:   PORT WEBRTC_PORT REC_DIR FFMPEG RTSP_COMPOSITE
+Env:   PORT WEBRTC_PORT REC_DIR FFMPEG CAM_IPS
 """
 import atexit, glob, json, os, shutil, signal, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT        = int(os.environ.get("PORT", "8088"))
 WEBRTC_PORT = int(os.environ.get("WEBRTC_PORT", "8889"))
-RTSP_COMPOSITE = os.environ.get("RTSP_COMPOSITE", "rtsp://localhost:8554/composite")
 REC_DIR = os.environ.get("REC_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings"))
 os.makedirs(REC_DIR, exist_ok=True)
 
@@ -243,14 +242,19 @@ def _post_record(mkv_path, elapsed):
 # ---------------------------------------------------------------------------
 MAX_REC_SECONDS = int(os.environ.get("REC_MAX_SECONDS", str(8 * 3600)))  # 8h cap
 
+def _cam_paths():
+    """[(mediamtx path, friendly name)] for each camera; falls back to composite."""
+    if CAMS:
+        return [(f"cam{i+1}", name) for i, (ip, name) in enumerate(CAMS)]
+    return [("composite", "Cameras")]
+
 class Recorder:
+    """Records each camera independently, so one camera failing never stops the
+    others. A session is 'recording' while any per-camera recorder is alive."""
     def __init__(self):
-        self.lock = threading.Lock(); self.proc=None; self.file=None; self.started=None
-        self._timer=None
+        self.lock = threading.Lock(); self.sessions = []; self.started = None; self._timer = None
     def _arm_cap(self):
-        if self._timer:
-            try: self._timer.cancel()
-            except Exception: pass
+        self._disarm_cap()
         self._timer = threading.Timer(MAX_REC_SECONDS, self._auto_stop)
         self._timer.daemon = True; self._timer.start()
     def _disarm_cap(self):
@@ -258,68 +262,66 @@ class Recorder:
             try: self._timer.cancel()
             except Exception: pass
             self._timer = None
+    def _alive(self):
+        return any(s["proc"] and s["proc"].poll() is None for s in self.sessions)
     def _auto_stop(self):
-        if self.proc and self.proc.poll() is None:
-            print(f"recorder: reached {MAX_REC_SECONDS}s cap, auto-stopping")
-            self.stop()
+        if self._alive():
+            print(f"recorder: reached {MAX_REC_SECONDS}s cap, auto-stopping"); self.stop()
     def _state(self):
-        return {"recording": self.proc is not None,
-                "file": os.path.basename(self.file) if self.file else None,
-                "elapsed": int(time.time()-self.started) if self.started else 0}
+        n = sum(1 for s in self.sessions if s["proc"] and s["proc"].poll() is None)
+        rec = n > 0
+        return {"recording": rec, "cams": n,
+                "elapsed": int(time.time()-self.started) if (rec and self.started) else 0}
     def status(self):
         with self.lock:
-            if self.proc and self.proc.poll() is not None:
-                self.proc=None; self.file=None; self.started=None
             return self._state()
     def start(self):
         with self.lock:
-            if self.proc and self.proc.poll() is None: return self._state()
-            path = os.path.join(REC_DIR, time.strftime("rec_%Y%m%d_%H%M%S.mkv"))
-            # copy the already-composited stream (video H264 + audio Opus) to mkv
-            cmd = [FFMPEG, "-loglevel", "error", "-nostdin",
-                   "-rtsp_transport", "tcp", "-i", RTSP_COMPOSITE,
-                   "-map", "0", "-c", "copy", "-f", "matroska", path]
-            # retry a few times in case the composite is momentarily unavailable
-            for attempt in range(4):
-                p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-                time.sleep(0.6)
-                if p.poll() is None:              # still running -> connected OK
-                    self.proc = p; self.file = path; self.started = time.time()
-                    self._arm_cap()               # auto-stop after MAX_REC_SECONDS
-                    return self._state()
-                try: os.path.exists(path) and os.path.getsize(path) == 0 and os.remove(path)
-                except OSError: pass
-                time.sleep(0.8)
-            # gave up
-            self.proc = None; self.file = None; self.started = None
-            return {"recording": False, "file": None, "elapsed": 0, "error": "composite unavailable"}
+            if self._alive(): return self._state()
+            ts = time.strftime("%Y%m%d_%H%M%S"); self.sessions = []
+            for path, name in _cam_paths():
+                mkv = os.path.join(REC_DIR, f"rec_{ts}_{path}.mkv")
+                cmd = [FFMPEG, "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp",
+                       "-i", f"rtsp://localhost:8554/{path}", "-map", "0", "-c", "copy",
+                       "-f", "matroska", mkv]
+                self.sessions.append({"path": path, "name": name, "mkv": mkv,
+                                      "proc": subprocess.Popen(cmd, stdin=subprocess.PIPE)})
+            time.sleep(1.5)                                   # let them connect
+            for s in list(self.sessions):                    # drop cameras that didn't start
+                if s["proc"].poll() is not None:
+                    try: os.path.exists(s["mkv"]) and os.path.getsize(s["mkv"]) == 0 and os.remove(s["mkv"])
+                    except OSError: pass
+                    self.sessions.remove(s)
+            if not self.sessions:
+                self.started = None
+                return {"recording": False, "cams": 0, "elapsed": 0, "error": "no cameras available"}
+            self.started = time.time(); self._arm_cap()
+            return self._state()
     def stop(self):
         with self.lock:
             self._disarm_cap()
-            p=self.proc; done=self.file; st=self.started
-            if not p or p.poll() is not None:
-                self.proc=None; self.file=None; self.started=None
-                return {"recording":False,"file":None,"elapsed":0}
+            sess = self.sessions; st = self.started
+            self.sessions = []; self.started = None
+        if not sess: return {"recording": False, "cams": 0, "elapsed": 0}
         elapsed = int(time.time()-st) if st else 0
-        try:
-            if p.stdin:
-                try: p.stdin.write(b"q"); p.stdin.flush()
+        for s in sess:
+            p = s["proc"]
+            if p and p.poll() is None:
+                try:
+                    if p.stdin: p.stdin.write(b"q"); p.stdin.flush()
                 except Exception: pass
-            try: p.send_signal(signal.SIGINT)
-            except Exception: pass
-            try: p.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                p.terminate()
-                try: p.wait(timeout=4)
-                except subprocess.TimeoutExpired: p.kill()
-        finally:
-            with self.lock:
-                self.proc=None; self.file=None; self.started=None
-        # ship the finished file to configured sinks in the background (never blocks stop)
-        if done and _any_sink():
-            threading.Thread(target=_post_record, args=(done, elapsed),
-                             daemon=True).start()
-        return {"recording":False,"file":os.path.basename(done) if done else None,"elapsed":0}
+                try: p.send_signal(signal.SIGINT)
+                except Exception: pass
+                try: p.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    p.terminate()
+                    try: p.wait(timeout=4)
+                    except subprocess.TimeoutExpired: p.kill()
+            # upload each camera's file (if it captured anything)
+            if _any_sink() and os.path.exists(s["mkv"]) and os.path.getsize(s["mkv"]) > 2000:
+                threading.Thread(target=_post_record, args=(s["mkv"], elapsed),
+                                 daemon=True).start()
+        return {"recording": False, "cams": 0, "elapsed": 0}
 REC = Recorder()
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -455,37 +457,18 @@ def _tg_set_commands():
     try: _tg_api("setMyCommands", fields={"commands": _json.dumps(cmds)})
     except Exception: pass
 
-def _snapshot():
-    """Grab one frame from the composite (both cameras) as a JPEG; return path."""
-    import tempfile
-    fd, path = tempfile.mkstemp(suffix=".jpg", prefix="snap_"); os.close(fd)
-    try:
-        subprocess.run([FFMPEG, "-loglevel", "error", "-rtsp_transport", "tcp",
-                        "-i", RTSP_COMPOSITE, "-frames:v", "1", "-q:v", "3", "-y", path],
-                       check=True, timeout=15)
-        if os.path.getsize(path) > 0:
-            return path
-    except Exception as e:
-        print("snapshot failed:", e)
-    try: os.remove(path)
-    except OSError: pass
-    return None
-
 def _tg_snap_reply(caption):
-    """Send the current composite frame as a photo, captioned; fall back to text."""
-    snap = _snapshot()
-    if not snap:
-        _tg_reply(caption); return
-    try:
-        boundary, body = _tg_multipart({"chat_id": TG_CHAT, "caption": caption},
-                                       "photo", snap, ctype="image/jpeg")
-        r = _tg_api("sendPhoto", boundary=boundary, body=body)
-        if not r.get("ok"): _tg_reply(caption)
-    except Exception as e:
-        print("telegram: photo failed:", e); _tg_reply(caption)
-    finally:
-        try: os.remove(snap)
-        except OSError: pass
+    """Send a snapshot from each online camera, captioned; fall back to text."""
+    sent = False
+    for ip, name in CAMS:
+        img = _cam_snapshot(ip)
+        if img:
+            try:
+                if _tg_send_photo(img, f"{caption} · {name}"): sent = True
+            except Exception as e:
+                print("telegram: photo failed:", e)
+    if not sent:
+        _tg_reply(caption)
 
 def _tg_handle(text):
     """Run one command; may block (start/stop/snapshot), so it runs off the poll loop."""

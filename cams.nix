@@ -5,7 +5,7 @@
 #   2) in /etc/nixos/configuration.nix add:   imports = [ ./cams/cams.nix ];
 #   3) sudo nixos-rebuild switch
 #
-# Services: cams-mediamtx (WebRTC server + compositor) and cams-app (web page +
+# Services: cams-mediamtx (per-camera WebRTC) and cams-app (web page +
 # recorder). Recordings persist in /var/lib/cams/recordings.
 { config, lib, pkgs, ... }:
 
@@ -69,20 +69,6 @@ let
           - action: read
           - action: playback
     paths:
-      composite:
-        runOnInit: >
-          ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin
-          -fflags +genpts -flags low_delay
-          -rtsp_transport tcp -i rtsp://${cred}${cam1}:554/${rtspPath}
-          -rtsp_transport tcp -i rtsp://${cred}${cam2}:554/${rtspPath}
-          -filter_complex "[0:v]scale=640:-2,setsar=1[v0];[1:v]scale=640:-2,setsar=1[v1];[v0][v1]vstack=inputs=2[v];[0:a][1:a]amix=inputs=2:normalize=0,aresample=async=1:first_pts=0[a]"
-          -map "[v]" -map "[a]"
-          -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p
-          -g 10 -keyint_min 10 -bf 0
-          -c:a libopus -b:a 64k -ac 2 -application lowdelay
-          -muxdelay 0 -muxpreload 0
-          -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/composite
-        runOnInitRestart: yes
       cam1:
         record: yes
         runOnInit: >
@@ -140,7 +126,7 @@ in {
       RCLONE = "${rclone}/bin/rclone";
       RCLONE_CONFIG = "/run/cams-app/rclone.conf";   # copied in from /etc/cams below
       GDRIVE_REMOTE = gdriveRemote;
-      WHEP_URL = "/composite/whep";           # same-origin signaling through nginx
+      WHEP_URL = "1";                         # tells the page to use same-origin signaling
     };
     serviceConfig = {
       ExecStart = "${python}/bin/python3 ${appPy}";
@@ -161,7 +147,7 @@ in {
 
   # Reverse proxy on :80 so you browse http://${webHost} with no custom port.
   # "/"           -> the app (page, /status, /record/*)
-  # "/composite/" -> MediaMTX WebRTC signaling (WHEP)
+  # "/cam1/","/cam2/" -> MediaMTX WebRTC signaling (WHEP)
   # WebRTC media still flows directly on 8189 (over the VPN) — not proxied.
   services.nginx = {
     enable = true;
@@ -172,10 +158,6 @@ in {
       forceSSL = true;                       # redirect http:80 -> https:443
       locations."/" = {
         proxyPass = "http://127.0.0.1:${toString webPort}";
-        proxyWebsockets = true;
-      };
-      locations."/composite/" = {
-        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
         proxyWebsockets = true;
       };
       locations."/cam1/" = {
