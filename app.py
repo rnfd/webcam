@@ -676,10 +676,41 @@ def _motion_watch():
         except Exception as e:
             print("motion: loop error:", e); time.sleep(5)
 
+def _cam_reachable(ip):
+    import socket
+    s = socket.socket(); s.settimeout(3)
+    try: s.connect((ip, 554)); return True       # RTSP port up = camera online
+    except OSError: return False
+    finally: s.close()
+
+def _cam_health_watch():
+    """Notify Telegram when a camera goes offline / comes back (debounced)."""
+    print("health: watcher started")
+    state = {ip: _cam_reachable(ip) for ip, _ in CAMS}   # baseline, no notify
+    fails = {ip: 0 for ip, _ in CAMS}
+    while True:
+        time.sleep(10)
+        for ip, name in CAMS:
+            up = _cam_reachable(ip)
+            if up:
+                fails[ip] = 0
+                if not state[ip]:
+                    state[ip] = True
+                    print("health:", name, "reconnected")
+                    if TG_TOKEN and TG_CHAT: _tg_reply(f"✅ {name} reconnected")
+            else:
+                fails[ip] += 1
+                if state[ip] and fails[ip] >= 2:          # ~20s before declaring down
+                    state[ip] = False
+                    print("health:", name, "disconnected")
+                    if TG_TOKEN and TG_CHAT: _tg_reply(f"🔌 {name} disconnected")
+
 def main():
     ensure_mediamtx()
     atexit.register(_shutdown)
     signal.signal(signal.SIGTERM, lambda *_:(_shutdown(), sys.exit(0)))
+    if CAMS:
+        threading.Thread(target=_cam_health_watch, daemon=True).start()
     if TG_TOKEN and TG_CHAT:
         threading.Thread(target=_tg_command_loop, daemon=True).start()
         if CAMS:
