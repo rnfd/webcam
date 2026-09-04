@@ -340,6 +340,7 @@ html,body{margin:0;height:100%;background:#000;color:#eee;font:15px/1.4 -apple-s
   justify-content:center;background:#0b0b0b;border-top:1px solid #222;padding:0 12px;padding-bottom:env(safe-area-inset-bottom)}
 #rec{font:600 16px system-ui;color:#fff;background:#dc2626;border:0;border-radius:999px;padding:12px 22px;cursor:pointer;min-width:150px}
 #rec.on{background:#374151}
+#snd{font:600 16px system-ui;color:#fff;background:#374151;border:0;border-radius:999px;padding:12px 18px;cursor:pointer}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#dc2626;margin-right:8px;vertical-align:middle;animation:blink 1s steps(2,start) infinite}
 @keyframes blink{to{opacity:.2}}
 #stat{color:#bbb;font-variant-numeric:tabular-nums;min-width:150px}
@@ -352,20 +353,14 @@ html,body{margin:0;height:100%;background:#000;color:#eee;font:15px/1.4 -apple-s
   <div class="cam"><b>Camera 1</b><video id="v1" playsinline webkit-playsinline autoplay controls muted></video></div>
   <div class="cam"><b>Camera 2</b><video id="v2" playsinline webkit-playsinline autoplay controls muted></video></div>
 </div>
-<div class="bar"><button id="rec">● Record</button><span id="stat">—</span></div>
-<div class="gate" id="gate">
-  <div style="font-size:20px;font-weight:700">Cameras</div>
-  <button class="play" id="go">▶  Play with sound</button>
-  <div class="hint">Two independent camera feeds, near real-time. Tap to start.</div>
-  <div class="hint" id="cstat" style="color:#4ade80">starting…</div>
-</div>
+<div class="bar"><button id="snd">🔊 Sound</button><button id="rec">● Record</button><span id="stat">—</span></div>
 <div id="err"></div>
 <script>
 var v1=document.getElementById('v1'),v2=document.getElementById('v2'),
-    gate=document.getElementById('gate'),go=document.getElementById('go'),
+    snd=document.getElementById('snd'),
     rec=document.getElementById('rec'),stat=document.getElementById('stat'),err=document.getElementById('err'),
-    cstat=document.getElementById('cstat'),WHEP_BASE=__WHEP_BASE__,busy=false,ok={};
-function say(m){ cstat.textContent=m; }
+    WHEP_BASE=__WHEP_BASE__,busy=false,ok={},muted=true;
+function say(m){ err.textContent=m; }
 if(!window.RTCPeerConnection){ say('this browser has no WebRTC support'); }
 function setup(video, path){
   var pc=new RTCPeerConnection({iceServers:[]});
@@ -393,11 +388,12 @@ function setup(video, path){
     }catch(e){ say(path+' error: '+e.message); }
   })();
 }
-setup(v1,'cam1'); setup(v2,'cam2');
-// Tap = unmute + play both, dismiss the gate no matter what.
-go.onclick=function(){
-  [v1,v2].forEach(function(v){ v.muted=false; v.volume=1; var p=v.play(); if(p&&p.catch)p.catch(function(){}); });
-  gate.style.display='none';
+setup(v1,'cam1'); setup(v2,'cam2');   // both autoplay muted immediately
+// Sound toggle (unmute needs this tap; muted autoplay needs none).
+snd.onclick=function(){
+  muted=!muted;
+  [v1,v2].forEach(function(v){ v.muted=muted; if(!muted){ v.volume=1; v.play().catch(function(){}); } });
+  snd.textContent = muted ? '🔊 Sound' : '🔇 Mute';
 };
 function fmt(s){var m=Math.floor(s/60),ss=s%60;return (m<10?'0':'')+m+':'+(ss<10?'0':'')+ss;}
 function render(st){
