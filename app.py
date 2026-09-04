@@ -243,9 +243,7 @@ def _post_record(mkv_path, elapsed):
 MAX_REC_SECONDS = int(os.environ.get("REC_MAX_SECONDS", str(8 * 3600)))  # 8h cap
 
 def _cam_paths():
-    """[(mediamtx path, friendly name)] for each camera; falls back to composite."""
-    if CAMS:
-        return [(f"cam{i+1}", name) for i, (ip, name) in enumerate(CAMS)]
+    """Record the single stacked composite (resilient: black pane if a cam is down)."""
     return [("composite", "Cameras")]
 
 class Recorder:
@@ -330,14 +328,8 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}
 html,body{margin:0;height:100%;background:#000;color:#eee;font:15px/1.4 -apple-system,system-ui,sans-serif}
-.stage{position:fixed;inset:0 0 64px 0;display:flex;flex-direction:column;gap:6px;
-  align-items:center;justify-content:center;padding:6px;overflow:auto}
-.cam{position:relative;max-width:100%;max-height:calc(50% - 6px);display:flex}
-.cam video{max-width:100%;max-height:100%;width:auto;background:#000;border-radius:6px}
-.cam b{position:absolute;top:6px;left:8px;padding:1px 7px;border-radius:4px;
-  background:rgba(0,0,0,.55);font-size:12px;font-weight:600}
-@media (min-aspect-ratio:1/1){ .stage{flex-direction:row}
-  .cam{max-width:calc(50% - 6px);max-height:100%} }
+.stage{position:fixed;inset:0 0 64px 0;display:flex;align-items:center;justify-content:center;padding:6px}
+.stage video{max-width:100%;max-height:100%;width:auto;background:#000;border-radius:6px}
 .bar{position:fixed;left:0;right:0;bottom:0;height:64px;display:flex;gap:12px;align-items:center;
   justify-content:center;background:#0b0b0b;border-top:1px solid #222;padding:0 12px;padding-bottom:env(safe-area-inset-bottom)}
 #rec{font:600 16px system-ui;color:#fff;background:#dc2626;border:0;border-radius:999px;padding:12px 22px;cursor:pointer;min-width:150px}
@@ -352,16 +344,15 @@ html,body{margin:0;height:100%;background:#000;color:#eee;font:15px/1.4 -apple-s
 #err{position:fixed;left:8px;right:8px;bottom:70px;color:#f87171;font-size:12px;text-align:center}
 </style></head><body>
 <div class="stage">
-  <div class="cam"><b>Camera 1</b><video id="v1" playsinline webkit-playsinline autoplay controls muted></video></div>
-  <div class="cam"><b>Camera 2</b><video id="v2" playsinline webkit-playsinline autoplay controls muted></video></div>
+  <video id="v" playsinline webkit-playsinline autoplay controls muted></video>
 </div>
 <div class="bar"><button id="snd">🔊 Sound</button><button id="rec">● Record</button><span id="stat">—</span></div>
 <div id="err"></div>
 <script>
-var v1=document.getElementById('v1'),v2=document.getElementById('v2'),
+var v=document.getElementById('v'),
     snd=document.getElementById('snd'),
     rec=document.getElementById('rec'),stat=document.getElementById('stat'),err=document.getElementById('err'),
-    WHEP_BASE=__WHEP_BASE__,busy=false,ok={},muted=true;
+    WHEP_BASE=__WHEP_BASE__,muted=true,busy=false;
 function say(m){ err.textContent=m; }
 if(!window.RTCPeerConnection){ say('this browser has no WebRTC support'); }
 function setup(video, path){
@@ -371,9 +362,9 @@ function setup(video, path){
   pc.ontrack=function(e){ try{e.receiver.playoutDelayHint=0;}catch(_){}
     if(video.srcObject!==e.streams[0]) video.srcObject=e.streams[0]; video.play().catch(function(){}); };
   pc.onconnectionstatechange=function(){
-    if(pc.connectionState==='connected'){ ok[path]=1; if(ok.cam1&&ok.cam2){say('connected');err.textContent='';} }
+    if(pc.connectionState==='connected'){ say(''); }
     else if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){
-      ok[path]=0; say(path+' '+pc.connectionState+' — retrying…');
+      say('reconnecting…');
       setTimeout(function(){ try{pc.close()}catch(e){}; setup(video,path); },1500);
     }
   };
@@ -383,18 +374,17 @@ function setup(video, path){
       await new Promise(function(res){ if(pc.iceGatheringState==='complete')return res();
         var t=setTimeout(res,1500);
         pc.onicegatheringstatechange=function(){ if(pc.iceGatheringState==='complete'){clearTimeout(t);res();} }; });
-      var url=WHEP_BASE+'/'+path+'/whep';
-      var resp=await fetch(url,{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
-      if(!resp.ok){ say(path+' signaling HTTP '+resp.status); return; }
+      var resp=await fetch(WHEP_BASE+'/'+path+'/whep',{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
+      if(!resp.ok){ say('signaling HTTP '+resp.status); return; }
       await pc.setRemoteDescription({type:'answer',sdp:await resp.text()});
-    }catch(e){ say(path+' error: '+e.message); }
+    }catch(e){ say('error: '+e.message); }
   })();
 }
-setup(v1,'cam1'); setup(v2,'cam2');   // both autoplay muted immediately
+setup(v,'composite');                 // one stacked stream, autoplays muted
 // Sound toggle (unmute needs this tap; muted autoplay needs none).
 snd.onclick=function(){
   muted=!muted;
-  [v1,v2].forEach(function(v){ v.muted=muted; if(!muted){ v.volume=1; v.play().catch(function(){}); } });
+  v.muted=muted; if(!muted){ v.volume=1; v.play().catch(function(){}); }
   snd.textContent = muted ? '🔊 Sound' : '🔇 Mute';
 };
 function fmt(s){var m=Math.floor(s/60),ss=s%60;return (m<10?'0':'')+m+':'+(ss<10?'0':'')+ss;}
@@ -458,17 +448,22 @@ def _tg_set_commands():
     except Exception: pass
 
 def _tg_snap_reply(caption):
-    """Send a snapshot from each online camera, captioned; fall back to text."""
-    sent = False
-    for ip, name in CAMS:
-        img = _cam_snapshot(ip)
-        if img:
-            try:
-                if _tg_send_photo(img, f"{caption} · {name}"): sent = True
-            except Exception as e:
-                print("telegram: photo failed:", e)
-    if not sent:
-        _tg_reply(caption)
+    """Send one composite snapshot (both cameras stacked); fall back to text."""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+    ok = False
+    try:
+        subprocess.run([FFMPEG, "-loglevel", "error", "-rtsp_transport", "tcp",
+                        "-i", "rtsp://localhost:8554/composite", "-frames:v", "1",
+                        "-q:v", "3", "-y", path], check=True, timeout=15)
+        if os.path.getsize(path) > 0:
+            with open(path, "rb") as f: ok = _tg_send_photo(f.read(), caption)
+    except Exception as e:
+        print("snapshot failed:", e)
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+    if not ok: _tg_reply(caption)
 
 def _tg_handle(text):
     """Run one command; may block (start/stop/snapshot), so it runs off the poll loop."""

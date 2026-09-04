@@ -37,6 +37,33 @@ let
   rtspPath = "h264Preview_01_${stream}";
   cred = if camUser == "" then "" else "${camUser}:${camPass}@";
 
+  # Resilient per-camera publisher: stream the camera when it's up, publish a
+  # black frame + silence when it's down, so downstream (composite) never breaks
+  # and a missing camera shows as a blank panel. Args: <camera-ip> <mediamtx-path>
+  camPublish = pkgs.writeShellScript "cam-publish" ''
+    set -u
+    ip="$1"; path="$2"
+    cam="rtsp://${cred}$ip:554/${rtspPath}"
+    out="rtsp://localhost:8554/$path"
+    FF="${ffmpeg}/bin/ffmpeg"
+    reachable() { ${pkgs.coreutils}/bin/timeout 3 ${pkgs.bash}/bin/bash -c "exec 3<>/dev/tcp/$ip/554" 2>/dev/null; }
+    while true; do
+      if reachable; then
+        # camera up: stream it (blocks until it drops)
+        "$FF" -hide_banner -loglevel warning -nostdin -rtsp_transport tcp \
+          -i "$cam" -map 0 -c:v copy -c:a libopus -b:a 64k -ac 2 \
+          -f rtsp -rtsp_transport tcp "$out" || true
+      else
+        # camera down: publish ~10s of black + silence, then re-check
+        "$FF" -hide_banner -loglevel warning -nostdin -re \
+          -f lavfi -i "color=c=black:s=896x512:r=10" -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+          -t 10 -c:v libx264 -preset ultrafast -tune stillimage -pix_fmt yuv420p -g 20 \
+          -c:a libopus -b:a 32k -shortest -f rtsp -rtsp_transport tcp "$out" || true
+      fi
+      ${pkgs.coreutils}/bin/sleep 1
+    done
+  '';
+
   # MediaMTX config generated here so ${ffmpeg} is a real store path (GC-safe).
   mediamtxCfg = pkgs.writeText "mediamtx.yml" ''
     logLevel: info
@@ -71,19 +98,23 @@ let
     paths:
       cam1:
         record: yes
-        runOnInit: >
-          ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin
-          -rtsp_transport tcp -i rtsp://${cred}${cam1}:554/${rtspPath}
-          -map 0 -c:v copy -c:a libopus -b:a 64k -ac 2
-          -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/cam1
+        runOnInit: ${camPublish} ${cam1} cam1
         runOnInitRestart: yes
       cam2:
         record: yes
+        runOnInit: ${camPublish} ${cam2} cam2
+        runOnInitRestart: yes
+      # stacked composite of the two resilient streams (blank pane if a cam is down)
+      composite:
         runOnInit: >
-          ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin
-          -rtsp_transport tcp -i rtsp://${cred}${cam2}:554/${rtspPath}
-          -map 0 -c:v copy -c:a libopus -b:a 64k -ac 2
-          -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/cam2
+          ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin -fflags +genpts
+          -rtsp_transport tcp -i rtsp://localhost:$RTSP_PORT/cam1
+          -rtsp_transport tcp -i rtsp://localhost:$RTSP_PORT/cam2
+          -filter_complex "[0:v]scale=640:-2,setsar=1[v0];[1:v]scale=640:-2,setsar=1[v1];[v0][v1]vstack=inputs=2[v];[0:a][1:a]amix=inputs=2:normalize=0,aresample=async=1:first_pts=0[a]"
+          -map "[v]" -map "[a]"
+          -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 20
+          -c:a libopus -b:a 64k -ac 2
+          -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/composite
         runOnInitRestart: yes
   '';
 
@@ -158,6 +189,10 @@ in {
       forceSSL = true;                       # redirect http:80 -> https:443
       locations."/" = {
         proxyPass = "http://127.0.0.1:${toString webPort}";
+        proxyWebsockets = true;
+      };
+      locations."/composite/" = {
+        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
         proxyWebsockets = true;
       };
       locations."/cam1/" = {
