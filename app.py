@@ -83,6 +83,10 @@ MOTION_COOLDOWN = int(os.environ.get("MOTION_COOLDOWN", "30"))  # seconds per ev
 PLAYBACK   = os.environ.get("PLAYBACK_URL", "http://localhost:9996")  # MediaMTX playback
 MOTION_PRE  = int(os.environ.get("MOTION_PRE", "3"))   # seconds before detection
 MOTION_POST = int(os.environ.get("MOTION_POST", "3"))  # seconds after detection
+# motion-clip compression (re-encode to keep the Telegram video small)
+CLIP_CRF   = os.environ.get("CLIP_CRF", "30")      # higher = smaller/lower quality
+CLIP_WIDTH = os.environ.get("CLIP_WIDTH", "480")   # scale to this width
+CLIP_ABR   = os.environ.get("CLIP_ABR", "24k")     # audio bitrate (mono)
 
 def _fmt_size(n):
     n = float(n)
@@ -604,8 +608,10 @@ def _playback_clip(path, det_epoch):
     try:
         with open(raw, "wb") as f: f.write(urllib.request.urlopen(url, timeout=30).read())
         subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-i", raw,
-                        "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
-                        "-movflags", "+faststart", out], check=True, timeout=60)
+                        "-vf", f"scale={CLIP_WIDTH}:-2", "-c:v", "libx264",
+                        "-preset", "veryfast", "-crf", CLIP_CRF, "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", CLIP_ABR, "-ac", "1",
+                        "-movflags", "+faststart", out], check=True, timeout=120)
         os.remove(raw)
         return out
     except Exception as e:
