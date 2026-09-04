@@ -72,6 +72,15 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID")
 TG_LIMIT = 50 * 1024 * 1024   # cloud Bot API upload cap
 
+# Cameras for motion detection / per-camera snapshots. CAM_IPS="ip=Name,ip=Name"
+CAM_USER = os.environ.get("CAM_USER", "admin")
+CAM_PASS = os.environ.get("CAM_PASS", "")
+CAMS = []
+for _it in os.environ.get("CAM_IPS", "").split(","):
+    _ip, _, _nm = _it.strip().partition("=")
+    if _ip: CAMS.append((_ip, _nm or _ip))
+MOTION_COOLDOWN = int(os.environ.get("MOTION_COOLDOWN", "30"))  # seconds per event
+
 def _tg_api(method, boundary=None, body=None, fields=None):
     import urllib.request, urllib.parse
     url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
@@ -428,7 +437,7 @@ def _tg_reply(text):
 
 def _tg_set_commands():
     import json as _json
-    cmds = [{"command": "record", "description": "Start recording"},
+    cmds = [{"command": "start", "description": "Start recording + motion alerts"},
             {"command": "stop", "description": "Stop recording"},
             {"command": "status", "description": "Recording status"}]
     try: _tg_api("setMyCommands", fields={"commands": _json.dumps(cmds)})
@@ -468,9 +477,9 @@ def _tg_snap_reply(caption):
 
 def _tg_handle(text):
     """Run one command; may block (start/stop/snapshot), so it runs off the poll loop."""
-    if text in ("/record", "/rec"):
+    if text in ("/start", "/record", "/rec"):
         st = REC.start()
-        cap = ("🔴 Recording started." if st.get("recording")
+        cap = ("🔴 Recording started — watching for movement." if st.get("recording")
                else "⚠️ Could not start (composite unavailable)."
                     if st.get("error") else "Already recording.")
         _tg_snap_reply(cap)
@@ -484,8 +493,8 @@ def _tg_handle(text):
         st = REC.status()
         cap = (f"🔴 Recording  {_dur(st['elapsed'])}" if st.get("recording") else "⏹ Idle")
         _tg_snap_reply(cap)
-    elif text in ("/start", "/help"):
-        _tg_reply("Camera bot:\n/record — start\n/stop — stop\n/status — status")
+    elif text == "/help":
+        _tg_reply("Camera bot:\n/start — start recording + motion alerts\n/stop — stop\n/status — status")
 
 def _tg_get(params, read_timeout):
     import urllib.request, urllib.parse, json as _json
@@ -535,12 +544,88 @@ def _tg_command_loop():
             print("telegram: poll error:", e)
             time.sleep(3)
 
+# -------------------- Motion detection (Reolink AI) -> Telegram --------------------
+def _cam_api(ip, body, timeout=6):
+    import urllib.request, urllib.parse, ssl, json as _json
+    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+    qs = urllib.parse.urlencode({"user": CAM_USER, "password": CAM_PASS})
+    req = urllib.request.Request(f"http://{ip}/cgi-bin/api.cgi?{qs}",
+          data=_json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    return _json.loads(urllib.request.urlopen(req, timeout=timeout, context=ctx).read().decode())
+
+def _cam_detections(ip):
+    """Return the set of active detections on a camera: pet / person / motion."""
+    out = set()
+    try:
+        ai = _cam_api(ip, [{"cmd": "GetAiState", "action": 0, "param": {"channel": 0}}])[0].get("value", {})
+        if ai.get("dog_cat", {}).get("alarm_state"): out.add("pet")
+        if ai.get("people", {}).get("alarm_state"):  out.add("person")
+    except Exception: pass
+    if not out:                                   # fall back to generic motion
+        try:
+            if _cam_api(ip, [{"cmd": "GetMdState", "action": 0, "param": {"channel": 0}}])[0].get("value", {}).get("state"):
+                out.add("motion")
+        except Exception: pass
+    return out
+
+def _cam_snapshot(ip):
+    import urllib.request, urllib.parse, ssl, time as _t
+    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+    qs = urllib.parse.urlencode({"cmd": "Snap", "channel": 0, "rs": str(int(_t.time()*1000)),
+                                 "user": CAM_USER, "password": CAM_PASS})
+    try:
+        d = urllib.request.urlopen(f"http://{ip}/cgi-bin/api.cgi?{qs}", timeout=8, context=ctx).read()
+        return d if d[:2] == b"\xff\xd8" else None
+    except Exception: return None
+
+_MOTION_LABEL = {"pet": "🐕 Pet", "person": "🧍 Person", "motion": "🟡 Motion"}
+
+def _notify_motion(ip, name, ev):
+    cap = f"{_MOTION_LABEL.get(ev, ev)} detected · {name}"
+    img = _cam_snapshot(ip)
+    if img:
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+        with open(path, "wb") as f: f.write(img)
+        try:
+            boundary, body = _tg_multipart({"chat_id": TG_CHAT, "caption": cap},
+                                           "photo", path, ctype="image/jpeg")
+            _tg_api("sendPhoto", boundary=boundary, body=body)
+        except Exception as e:
+            print("motion: photo failed:", e); _tg_reply(cap)
+        finally:
+            try: os.remove(path)
+            except OSError: pass
+    else:
+        _tg_reply(cap)
+    print("motion:", cap)
+
+def _motion_watch():
+    """While recording, alert Telegram on camera detections (pet/person/motion)."""
+    print("motion: watcher started")
+    last = {}
+    while True:
+        try:
+            if TG_TOKEN and TG_CHAT and REC.status().get("recording"):
+                for ip, name in CAMS:
+                    for ev in _cam_detections(ip):
+                        key = (ip, ev)
+                        if time.time() - last.get(key, 0) > MOTION_COOLDOWN:
+                            last[key] = time.time()
+                            threading.Thread(target=_notify_motion, args=(ip, name, ev),
+                                             daemon=True).start()
+            time.sleep(2)
+        except Exception as e:
+            print("motion: loop error:", e); time.sleep(5)
+
 def main():
     ensure_mediamtx()
     atexit.register(_shutdown)
     signal.signal(signal.SIGTERM, lambda *_:(_shutdown(), sys.exit(0)))
     if TG_TOKEN and TG_CHAT:
         threading.Thread(target=_tg_command_loop, daemon=True).start()
+        if CAMS:
+            threading.Thread(target=_motion_watch, daemon=True).start()
     print(f"App on http://0.0.0.0:{PORT}  | WebRTC via MediaMTX :{WEBRTC_PORT} | recordings: {REC_DIR} | cap {MAX_REC_SECONDS}s")
     try: ThreadingHTTPServer(("0.0.0.0",PORT),H).serve_forever()
     except KeyboardInterrupt: pass

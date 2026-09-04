@@ -122,6 +122,10 @@ in {
       CAMS_NO_AUTOMTX = "1";                  # systemd runs MediaMTX
       REC_DIR = "/var/lib/cams/recordings";
       PYTHONUNBUFFERED = "1";                 # logs reach journald immediately
+      # cameras for motion detection / per-camera snapshots
+      CAM_IPS = "${cam1}=Camera 1,${cam2}=Camera 2";
+      CAM_USER = camUser;
+      CAM_PASS = camPass;
       # --- Google Drive (rclone). Upload activates once rclone.conf exists. ---
       RCLONE = "${rclone}/bin/rclone";
       RCLONE_CONFIG = "/run/cams-app/rclone.conf";   # copied in from /etc/cams below
