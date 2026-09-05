@@ -1,4 +1,5 @@
-# NixOS module: two-camera stacked/mixed WebRTC viewer with recording.
+# NixOS module: two cameras, one live WebRTC stream each (own link per camera),
+# recorded together as one stacked/mixed video.
 #
 # Install (survives reboots):
 #   1) copy this dir to a stable path, e.g. /etc/nixos/cams/ (with app.py alongside)
@@ -14,6 +15,12 @@ let
   mediamtx = pkgs.mediamtx;
   python = pkgs.python3;
   rclone = pkgs.rclone;           # for Google Drive upload
+  font = "${pkgs.dejavu_fonts.minimal}/share/fonts/truetype/DejaVuSans.ttf";  # placeholder captions
+
+  # Shared on/off switches, written by the app and read by the publishers below.
+  # A plain directory (not a service StateDirectory) because DynamicUser puts
+  # those under /var/lib/private, which the other service cannot traverse.
+  stateDir = "/var/lib/cams-state";
 
   # Google Drive: remote:path that rclone copies clips into. The rclone remote
   # (auth) lives in /etc/cams/rclone.conf (root 600); upload stays off until it
@@ -27,45 +34,30 @@ let
   cam2 = "192.168.1.185";
   camUser = "admin";
   camPass = "";                   # blank today; set a real password on the cameras
-  stream = "sub";                 # 'sub' (light) or 'main' (HD)
+  # Live views play the camera's MAIN stream (2880x1616), stream-copied, so the
+  # picture on the web is the camera's full quality and the server transcodes
+  # nothing. The SUB stream (896x512) is published alongside it for the page's
+  # SD toggle, for the always-on compositor, and for the motion-clip buffer —
+  # all of which are cheaper and no worse at those jobs.
+  mainStream = "main";
+  subStream = "sub";
   lanHost = "192.168.1.250";      # this box's LAN IP, advertised to WebRTC clients
   webHost = "cam.axonpipe.com";   # the name you browse to (port 80, no custom port)
   webPort = 8088;                 # app backend (fronted by nginx on :80)
   webrtcPort = 8889;
   # ----------------------------------------------------
 
-  rtspPath = "h264Preview_01_${stream}";
   cred = if camUser == "" then "" else "${camUser}:${camPass}@";
 
-  # Resilient per-camera publisher: stream the camera when it's up, publish a
-  # black frame + silence when it's down, so downstream (composite) never breaks
-  # and a missing camera shows as a blank panel. Args: <camera-ip> <mediamtx-path>
-  camPublish = pkgs.writeShellScript "cam-publish" ''
-    set -u
-    ip="$1"; path="$2"
-    cam="rtsp://${cred}$ip:554/${rtspPath}"
-    out="rtsp://localhost:8554/$path"
-    FF="${ffmpeg}/bin/ffmpeg"
-    reachable() { ${pkgs.coreutils}/bin/timeout 3 ${pkgs.bash}/bin/bash -c "exec 3<>/dev/tcp/$ip/554" 2>/dev/null; }
-    while true; do
-      if reachable; then
-        # camera up: stream it (blocks until it drops)
-        "$FF" -hide_banner -loglevel warning -nostdin -rtsp_transport tcp \
-          -i "$cam" -map 0 -c:v copy -c:a libopus -b:a 64k -ac 2 \
-          -f rtsp -rtsp_transport tcp "$out" || true
-      else
-        # camera down: publish ~10s of black + silence, then re-check
-        "$FF" -hide_banner -loglevel warning -nostdin -re \
-          -f lavfi -i "color=c=black:s=896x512:r=10" -f lavfi -i "anullsrc=r=48000:cl=stereo" \
-          -t 10 -c:v libx264 -preset ultrafast -tune stillimage -pix_fmt yuv420p -g 20 \
-          -c:a libopus -b:a 32k -shortest -f rtsp -rtsp_transport tcp "$out" || true
-      fi
-      ${pkgs.coreutils}/bin/sleep 1
-    done
-  '';
+  # Per-camera publisher — see cam-publish.sh for what it does. Kept as a file
+  # next to this module so local dev (mediamtx.yml) runs the exact same logic;
+  # the store paths it needs arrive through the service environment below.
+  camPublish = pkgs.writeShellScript "cam-publish" (builtins.readFile ./cam-publish.sh);
 
-  # Time-aligned stacked composite of the two resilient streams (blank pane if a
-  # cam is down). Each input is stamped with its arrival wall clock and ffmpeg's
+  # Time-aligned stacked composite of the two SUB streams (blank pane if a cam is
+  # down). Nothing on the web plays this; it exists so a recording is one
+  # combined video. Built from sub, not main, because it runs 24/7 and a 2880x1616
+  # decode+encode pair would burn cores to produce a downscaled stack anyway. Each input is stamped with its arrival wall clock and ffmpeg's
   # per-input rebasing is disabled (-copyts), so vstack pairs the frames that
   # arrived at the same moment rather than the Nth frame of each RTSP session
   # (those started ~3.5 s apart). -output_ts_offset shifts the merged output back
@@ -75,8 +67,8 @@ let
   camComposite = pkgs.writeShellScript "cam-composite" ''
     port="''${RTSP_PORT:-8554}"
     exec ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin -copyts \
-      -use_wallclock_as_timestamps 1 -rtsp_transport tcp -i "rtsp://localhost:$port/cam1" \
-      -use_wallclock_as_timestamps 1 -rtsp_transport tcp -i "rtsp://localhost:$port/cam2" \
+      -use_wallclock_as_timestamps 1 -rtsp_transport tcp -i "rtsp://localhost:$port/cam1sub" \
+      -use_wallclock_as_timestamps 1 -rtsp_transport tcp -i "rtsp://localhost:$port/cam2sub" \
       -filter_complex "[0:v]scale=640:-2,setsar=1[v0];[1:v]scale=640:-2,setsar=1[v1];[v0][v1]vstack=inputs=2[v];[0:a][1:a]amix=inputs=2:normalize=0,aresample=async=1[a]" \
       -map "[v]" -map "[a]" \
       -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 20 \
@@ -117,13 +109,23 @@ let
           - action: read
           - action: playback
     paths:
+      # HD: what the page plays by default — the camera's main stream, copied.
       cam1:
-        record: yes
-        runOnInit: ${camPublish} ${cam1} cam1
+        runOnInit: ${camPublish} ${cam1} cam1 ${mainStream}
         runOnInitRestart: yes
       cam2:
+        runOnInit: ${camPublish} ${cam2} cam2 ${mainStream}
+        runOnInitRestart: yes
+      # SD: the page's low-bandwidth toggle, the compositor's input, and the
+      # rolling buffer motion clips are cut from (record: yes here, not on the
+      # HD paths, so the 10-minute buffer stays small).
+      cam1sub:
         record: yes
-        runOnInit: ${camPublish} ${cam2} cam2
+        runOnInit: ${camPublish} ${cam1} cam1sub ${subStream}
+        runOnInitRestart: yes
+      cam2sub:
+        record: yes
+        runOnInit: ${camPublish} ${cam2} cam2sub ${subStream}
         runOnInitRestart: yes
       # time-aligned stacked composite (see camComposite above)
       composite:
@@ -133,16 +135,30 @@ let
 
   appPy = ./app.py;   # copied into the store on rebuild
 in {
+  # Both services join this group so they can share ${stateDir}: the app writes
+  # the on/off switches, the publishers read them.
+  users.groups.cams = {};
+  systemd.tmpfiles.rules = [ "d ${stateDir} 0770 root cams -" ];
+
   systemd.services.cams-mediamtx = {
     description = "Cameras: MediaMTX WebRTC server + compositor";
     wantedBy = [ "multi-user.target" ];
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
+    path = [ pkgs.coreutils pkgs.bash ffmpeg ];   # cam-publish.sh: timeout, sleep, ffmpeg
+    environment = {
+      FF = "${ffmpeg}/bin/ffmpeg";
+      FONT = font;                                # captions on the placeholders
+      CAMS_STATE = stateDir;                      # the /disable switch
+      CAM_USER = camUser;
+      CAM_PASS = camPass;
+    };
     serviceConfig = {
       ExecStart = "${mediamtx}/bin/mediamtx ${mediamtxCfg}";
       Restart = "always";
       RestartSec = 3;
       DynamicUser = true;
+      SupplementaryGroups = [ "cams" ];         # read the on/off switches
       RuntimeDirectory = "cams-mediamtx";       # writable cwd for the MoQ cert
       WorkingDirectory = "/run/cams-mediamtx";
       StateDirectory = "cams-mediamtx";         # -> /var/lib/cams-mediamtx (rec buffer)
@@ -161,9 +177,11 @@ in {
       FFMPEG = "${ffmpeg}/bin/ffmpeg";
       CAMS_NO_AUTOMTX = "1";                  # systemd runs MediaMTX
       REC_DIR = "/var/lib/cams/recordings";
+      CAMS_STATE = stateDir;                  # /enable /disable /follow live here
       PYTHONUNBUFFERED = "1";                 # logs reach journald immediately
       # cameras for motion detection / per-camera snapshots
       CAM_IPS = "${cam1}=Camera 1,${cam2}=Camera 2";
+      CLIP_PATH = "cam{n}sub";                # motion clips cut from the sub buffer
       CAM_USER = camUser;
       CAM_PASS = camPass;
       # --- Google Drive (rclone). Upload activates once rclone.conf exists. ---
@@ -180,6 +198,11 @@ in {
       Restart = "always";
       RestartSec = 3;
       DynamicUser = true;
+      SupplementaryGroups = [ "cams" ];       # write the on/off switches
+      # DynamicUser implies ProtectSystem=strict, which mounts /var/lib read-only
+      # apart from this service's own StateDirectory — the shared switch directory
+      # has to be punched through explicitly or /disable fails with EROFS.
+      ReadWritePaths = [ stateDir ];
       StateDirectory = "cams";                # -> /var/lib/cams (recordings)
       RuntimeDirectory = "cams-app";          # -> /run/cams-app (private)
       RuntimeDirectoryMode = "0700";
@@ -190,8 +213,9 @@ in {
   };
 
   # Reverse proxy on :80 so you browse http://${webHost} with no custom port.
-  # "/"           -> the app (page, /status, /record/*)
-  # "/cam1/","/cam2/" -> MediaMTX WebRTC signaling (WHEP)
+  # "/"           -> the app: "/" both cameras, "/1" and "/2" one each
+  #                  (separate live links), plus /status and /record/*
+  # "/cam1/","/cam2/" -> MediaMTX WebRTC signaling (WHEP), one per camera
   # WebRTC media still flows directly on 8189 (over the VPN) — not proxied.
   services.nginx = {
     enable = true;
@@ -213,6 +237,14 @@ in {
         proxyWebsockets = true;
       };
       locations."/cam2/" = {
+        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
+        proxyWebsockets = true;
+      };
+      locations."/cam1sub/" = {
+        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
+        proxyWebsockets = true;
+      };
+      locations."/cam2sub/" = {
         proxyPass = "http://127.0.0.1:${toString webrtcPort}";
         proxyWebsockets = true;
       };

@@ -12,6 +12,9 @@ rclone.conf
 auto.crt
 auto.key
 
+# local dev state (the /disable and /follow switches)
+state/
+
 # python
 __pycache__/
 *.pyc

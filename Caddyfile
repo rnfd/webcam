@@ -1,8 +1,8 @@
 # Reverse proxy so the cameras are reachable at cam.axonpipe.com with no port.
 # Fronts the app (page + record API) and MediaMTX (WebRTC signaling) on one origin.
 # The WebRTC MEDIA channel (UDP/TCP 8189) is NOT proxied — it stays a direct port,
-# reachable over the VPN. Run the app with WHEP_URL=/composite/whep so the page
-# uses same-origin signaling through this proxy.
+# reachable over the VPN. Run the app with WHEP_URL set (any value) so the page
+# signals same-origin (/cam1/whep, /cam2/whep) through this proxy.
 #
 # --- run it (needs privilege to bind 80/443) ---
 #   sudo CF_API_TOKEN=... caddy run --config Caddyfile
@@ -13,6 +13,12 @@
 # ============ PLAIN HTTP on port 80  ->  http://cam.axonpipe.com ============
 # Simplest. No certificate. Good for VPN-only use.
 http://cam.axonpipe.com {
+	handle /cam1/* {
+		reverse_proxy 127.0.0.1:8889
+	}
+	handle /cam2/* {
+		reverse_proxy 127.0.0.1:8889
+	}
 	handle /composite/* {
 		reverse_proxy 127.0.0.1:8889
 	}
@@ -30,6 +36,12 @@ http://cam.axonpipe.com {
 # cam.axonpipe.com {
 # 	tls {
 # 		dns cloudflare {env.CF_API_TOKEN}
+# 	}
+# 	handle /cam1/* {
+# 		reverse_proxy 127.0.0.1:8889
+# 	}
+# 	handle /cam2/* {
+# 		reverse_proxy 127.0.0.1:8889
 # 	}
 # 	handle /composite/* {
 # 		reverse_proxy 127.0.0.1:8889
