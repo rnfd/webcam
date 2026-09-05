@@ -19,7 +19,10 @@ clip to Telegram (as a link) and Google Drive. Runs as NixOS services.
 
 - **Compositing:** one ffmpeg pulls both cameras over RTSP, stacks the video
   (`vstack`) and mixes the audio (`amix`), and publishes a single `composite`
-  stream to MediaMTX.
+  stream to MediaMTX. The panes are time-aligned: each input is stamped with
+  its arrival wall clock (`-use_wallclock_as_timestamps 1`, `-copyts`), so the
+  stack pairs frames that arrived at the same moment instead of the Nth frame
+  of each RTSP session, which could be seconds apart.
 - **Viewing:** MediaMTX serves that stream over WebRTC (sub-second). The page is
   a WHEP client; nginx fronts it at `https://<host>` so there is no custom port.
 - **Recording:** the app stream-copies the composite to an `.mkv` (no re-encode,

@@ -64,6 +64,27 @@ let
     done
   '';
 
+  # Time-aligned stacked composite of the two resilient streams (blank pane if a
+  # cam is down). Each input is stamped with its arrival wall clock and ffmpeg's
+  # per-input rebasing is disabled (-copyts), so vstack pairs the frames that
+  # arrived at the same moment rather than the Nth frame of each RTSP session
+  # (those started ~3.5 s apart). -output_ts_offset shifts the merged output back
+  # by the launch epoch so timestamps leave the muxer near zero. A script, not an
+  # inline runOnInit, because MediaMTX does not run commands through a shell and
+  # the epoch has to be computed at start.
+  camComposite = pkgs.writeShellScript "cam-composite" ''
+    port="''${RTSP_PORT:-8554}"
+    exec ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin -copyts \
+      -use_wallclock_as_timestamps 1 -rtsp_transport tcp -i "rtsp://localhost:$port/cam1" \
+      -use_wallclock_as_timestamps 1 -rtsp_transport tcp -i "rtsp://localhost:$port/cam2" \
+      -filter_complex "[0:v]scale=640:-2,setsar=1[v0];[1:v]scale=640:-2,setsar=1[v1];[v0][v1]vstack=inputs=2[v];[0:a][1:a]amix=inputs=2:normalize=0,aresample=async=1[a]" \
+      -map "[v]" -map "[a]" \
+      -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 20 \
+      -c:a libopus -b:a 64k -ac 2 \
+      -output_ts_offset "-$(${pkgs.coreutils}/bin/date +%s)" \
+      -f rtsp -rtsp_transport tcp "rtsp://localhost:$port/composite"
+  '';
+
   # MediaMTX config generated here so ${ffmpeg} is a real store path (GC-safe).
   mediamtxCfg = pkgs.writeText "mediamtx.yml" ''
     logLevel: info
@@ -104,17 +125,9 @@ let
         record: yes
         runOnInit: ${camPublish} ${cam2} cam2
         runOnInitRestart: yes
-      # stacked composite of the two resilient streams (blank pane if a cam is down)
+      # time-aligned stacked composite (see camComposite above)
       composite:
-        runOnInit: >
-          ${ffmpeg}/bin/ffmpeg -loglevel warning -nostdin -fflags +genpts
-          -rtsp_transport tcp -i rtsp://localhost:$RTSP_PORT/cam1
-          -rtsp_transport tcp -i rtsp://localhost:$RTSP_PORT/cam2
-          -filter_complex "[0:v]scale=640:-2,setsar=1[v0];[1:v]scale=640:-2,setsar=1[v1];[v0][v1]vstack=inputs=2[v];[0:a][1:a]amix=inputs=2:normalize=0,aresample=async=1:first_pts=0[a]"
-          -map "[v]" -map "[a]"
-          -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 20
-          -c:a libopus -b:a 64k -ac 2
-          -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/composite
+        runOnInit: ${camComposite}
         runOnInitRestart: yes
   '';
 
