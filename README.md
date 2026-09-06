@@ -16,8 +16,10 @@ NixOS services.
 | `Caddyfile` | Alternative reverse-proxy config (nginx is used in the module) |
 | `snap.py` | One-off JPEG snapshot from a camera |
 
-Environment knobs worth knowing: `PTZ_SPEED` (default 32) and `PTZ_MAX_MOVE`
-(seconds a pan/tilt may run without a release, default 4).
+Environment knobs worth knowing: `PTZ_SPEED` (default 32), `PTZ_MAX_MOVE`
+(seconds a pan/tilt may run without a release, default 4), `TL_PRE`/`TL_POST`
+(seconds kept around each sighting, default 5 each), `TL_MAX_CLIPS` (default 600)
+and `TL_MAX_HOURS` (default 24).
 
 ## How it works
 
@@ -58,6 +60,16 @@ Environment knobs worth knowing: `PTZ_SPEED` (default 32) and `PTZ_MAX_MOVE`
   combined. Stop finalizes the file, then in the background it
   remuxes to MP4, uploads to Google Drive (rclone), and posts a link to Telegram
   with an upload progress bar. Recordings auto-stop after 8 hours.
+- **Timelapse of the dog:** `/timelapse 8h` watches both cameras for the dog and
+  keeps only the moments it appears — each sighting copies `[t-5s, t+5s]` out of
+  the rolling HD buffer MediaMTX keeps, so the seconds *before* the dog walked in
+  are there too. Windows never overlap (one every 10 s per camera at most, capped
+  at `TL_MAX_CLIPS`). At the end, each camera's clips are concatenated with a
+  stream copy — no re-encode, seconds to assemble — and uploaded to Google Drive
+  as one film per camera, with the link posted to Telegram. `/timelapse stop`
+  ends it early and still delivers what it caught; `/timelapse` on its own reports
+  progress. The dog/cat class ships **disabled** on these cameras, so the session
+  turns it on (`SetAiCfg`) and says so.
 - **Control:** the web button records; the Telegram bot carries the rest.
   `/enable` and `/disable` are the master switch. `/disable` turns the cameras
   themselves off as far as the network allows — there is no power or sleep command

@@ -110,10 +110,17 @@ let
           - action: playback
     paths:
       # HD: what the page plays by default — the camera's main stream, copied.
+      # Recorded on a short leash as well: /timelapse cuts its clips out of this
+      # buffer, which is what lets it keep the seconds *before* the dog appeared.
+      # 5 minutes of both cameras is ~230 MB at their 3 Mbit/s main stream.
       cam1:
+        record: yes
+        recordDeleteAfter: 5m
         runOnInit: ${camPublish} ${cam1} cam1 ${mainStream}
         runOnInitRestart: yes
       cam2:
+        record: yes
+        recordDeleteAfter: 5m
         runOnInit: ${camPublish} ${cam2} cam2 ${mainStream}
         runOnInitRestart: yes
       # SD: the page's low-bandwidth toggle, the compositor's input, and the

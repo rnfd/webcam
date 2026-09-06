@@ -39,9 +39,13 @@ paths:
   # compositor's input. Run MediaMTX from the repo root, and export FF/FONT to
   # get a specific ffmpeg and captioned placeholders.
   cam1:
+    record: yes
+    recordDeleteAfter: 5m       # /timelapse cuts its clips out of this buffer
     runOnInit: ./cam-publish.sh 192.168.1.146 cam1 main
     runOnInitRestart: yes
   cam2:
+    record: yes
+    recordDeleteAfter: 5m
     runOnInit: ./cam-publish.sh 192.168.1.185 cam2 main
     runOnInitRestart: yes
   cam1sub:
