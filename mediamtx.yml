@@ -3,8 +3,9 @@
 # small ones behind the page's SD button — plus the stacked composite that the
 # recorder and Telegram snapshots use.
 # Each camera publisher loops: while ./state/disabled exists (Telegram /disable)
-# it publishes a captioned placeholder and never opens an RTSP session to the
-# camera; otherwise it streams the camera.
+# it publishes nothing at all — no RTSP session to the camera and no encoder
+# standing in for it, so an idle path costs one sleeping shell; otherwise it
+# streams the camera.
 logLevel: info
 readTimeout: 15s
 writeTimeout: 15s
@@ -54,24 +55,10 @@ paths:
   cam2sub:
     runOnInit: ./cam-publish.sh 192.168.1.185 cam2sub sub
     runOnInitRestart: yes
-  # Stacked composite: nothing on the web plays it — it is what gets recorded to
-  # disk and Google Drive, so a session is one combined video. Built from the sub
-  # paths (it runs 24/7 and the stack is downscaled anyway), which also keeps each
-  # camera down to one RTSP session per stream.
+  # Stacked composite — the same cam-composite.sh the NixOS module runs, so the
+  # encode and the /disable behaviour are identical here. Nothing on the web
+  # plays it: it is what gets recorded to disk and Google Drive, so a session is
+  # one combined video.
   composite:
-    # always-on compositor: starts with the path, restarts on failure.
-    # Time-aligned: inputs are stamped with their arrival wall clock and per-input
-    # rebasing is off (-copyts), so vstack pairs frames that arrived together;
-    # -output_ts_offset shifts the merged output back to start near zero.
-    # (MediaMTX does not use a shell for commands, hence the sh -c wrapper for $(date).)
-    runOnInit: >
-      sh -c 'exec /nix/store/a2qfg58bz9c68lqgr4id8g2vvqdagman-ffmpeg-9.0.1-bin/bin/ffmpeg -loglevel warning -nostdin -copyts
-      -use_wallclock_as_timestamps 1 -rtsp_transport tcp -i rtsp://localhost:$RTSP_PORT/cam1sub
-      -use_wallclock_as_timestamps 1 -rtsp_transport tcp -i rtsp://localhost:$RTSP_PORT/cam2sub
-      -filter_complex "[0:v]scale=640:-2,setsar=1[v0];[1:v]scale=640:-2,setsar=1[v1];[v0][v1]vstack=inputs=2[v];[0:a][1:a]amix=inputs=2:normalize=0,aresample=async=1[a]"
-      -map "[v]" -map "[a]"
-      -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 30
-      -c:a libopus -b:a 64k -ac 2
-      -output_ts_offset -$(date +%s)
-      -f rtsp -rtsp_transport tcp rtsp://localhost:$RTSP_PORT/composite'
+    runOnInit: ./cam-composite.sh
     runOnInitRestart: yes

@@ -393,8 +393,13 @@ html,body{margin:0;height:100%;background:#000;color:#eee;font:15px/1.4 -apple-s
 .pane{position:relative;min-width:0;min-height:0;background:#000;border-radius:6px;overflow:hidden}
 .pane video{width:100%;height:100%;object-fit:contain;background:#000;display:block}
 .lbl{position:absolute;left:8px;top:8px;padding:3px 9px;border-radius:999px;
-  background:rgba(0,0,0,.55);color:#ddd;font-size:12px;pointer-events:none}
-.btns{position:absolute;right:8px;top:8px;display:flex;gap:6px}
+  background:rgba(0,0,0,.55);color:#ddd;font-size:12px;pointer-events:none;z-index:2}
+.btns{position:absolute;right:8px;top:8px;display:flex;gap:6px;z-index:2}
+/* Cameras off: nothing is published, so the pane draws its own panel rather than
+   playing a stream of a title card. Behind the label and buttons (z-index). */
+.pane.off::after{content:'⏸ cameras off';position:absolute;inset:0;z-index:1;
+  display:flex;align-items:center;justify-content:center;
+  background:#000;color:#6b7280;font:600 15px system-ui;letter-spacing:.02em}
 .btns button{font:600 14px system-ui;color:#fff;background:rgba(0,0,0,.55);border:0;
   border-radius:999px;padding:6px 10px;cursor:pointer}
 .btns button.on{background:#2563eb}
@@ -435,9 +440,28 @@ var CAMS=__CAMS__, WHEP_BASE=__WHEP_BASE__,
     players=[],busy=false;
 if(!window.RTCPeerConnection){ err.textContent='this browser has no WebRTC support'; }
 function note(p,m,bad){ p.msg.textContent=m; p.msg.className='msg'+(bad?' err':''); }
+// Nothing is published while the cameras are off, so there is no stream to play
+// and no point reconnecting at one: drop the peer connections and let the panes
+// show their own panel. Nulling p.pc makes every in-flight callback stale, which
+// is what cancels the reconnect timers already in the air.
+var camsOff=false;
+function teardown(){
+  players.forEach(function(p){
+    try{ p.pc && p.pc.close(); }catch(_){}
+    p.pc=null; p.video.srcObject=null; note(p,'');
+    p.video.parentNode.classList.add('off');
+  });
+}
+function restore(){
+  players.forEach(function(p){
+    p.video.parentNode.classList.remove('off');
+    note(p,'connecting…'); setup(p);
+  });
+}
 // One independent WHEP player per camera: its own peer connection and its own
 // reconnect loop, so one camera dropping never disturbs the other pane.
 function setup(p){
+  if(camsOff) return;
   var pc=new RTCPeerConnection({iceServers:[]}), path=p.path;
   p.pc=pc;
   function stale(){ return p.pc!==pc || p.path!==path; }
@@ -461,6 +485,7 @@ function setup(p){
       await new Promise(function(res){ if(pc.iceGatheringState==='complete')return res();
         var t=setTimeout(res,1500);
         pc.onicegatheringstatechange=function(){ if(pc.iceGatheringState==='complete'){clearTimeout(t);res();} }; });
+      if(stale()||camsOff){ try{pc.close()}catch(_){}; return; }   // switched off mid-gather
       var resp=await fetch(WHEP_BASE+'/'+path+'/whep',{method:'POST',
         headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
       if(stale()) { try{pc.close()}catch(_){}; return; }
@@ -570,8 +595,10 @@ function fmt(s){var m=Math.floor(s/60),ss=s%60;return (m<10?'0':'')+m+':'+(ss<10
 // The button is its own status line: while recording it grows a timer under the
 // label. Stopped, it just says what it does — that it is idle goes without saying.
 function render(st){
-  off.hidden = (st.enabled!==false);      // /disable from Telegram shows up here too
-  rec.disabled = (st.enabled===false);
+  var nowOff = (st.enabled===false);      // /disable from Telegram shows up here too
+  off.hidden = !nowOff; rec.disabled = nowOff;
+  // The players follow the switch, on the edge only — not on every poll.
+  if(nowOff!==camsOff){ camsOff=nowOff; if(nowOff) teardown(); else restore(); }
   if(st.recording){
     rlab.textContent='■ Stop'; rec.classList.add('on');
     rsub.innerHTML='<span class="dot"></span>REC '+fmt(st.elapsed); rsub.hidden=false;

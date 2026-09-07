@@ -77,9 +77,12 @@ and `TL_MAX_HOURS` (default 24).
   camera is looking as a PTZ preset, tilts the lens down into the base, and
   switches off the camera's own recording, push alerts, IR and status LEDs. On top
   of that the publishers stop opening RTSP sessions entirely, so nothing is
-  captured; they publish a "CAMERAS OFF" placeholder instead, the page shows a ⏸
-  badge and its record button greys out. `/enable` puts back exactly the settings
-  that were there (saved in `camera-settings.json`) and recalls the saved view —
+  captured — and nothing is published at all, so MediaMTX stops recording those
+  paths, the compositor stops encoding, and an idle camera costs one sleeping
+  shell rather than an ffmpeg. The page reads the same switch: each pane draws a
+  "cameras off" panel, the bar shows a ⏸ badge and the record button greys out.
+  `/enable` puts back exactly the settings that were there (saved in
+  `camera-settings.json`) and recalls the saved view —
   twice, because the head settles a few degrees off on the first recall after
   driving into the tilt stop. `/follow` and `/unfollow` turn detection alerts on and
   off (independent of recording — following works whether or not you are

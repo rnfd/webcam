@@ -7,15 +7,19 @@
 # while a stream is running, because an ffmpeg pulling a healthy camera blocks
 # forever and would otherwise ignore the switch until the camera dropped:
 #
-#   $CAMS_STATE/disabled exists -> "CAMERAS OFF": no RTSP session is opened to
-#                                  the camera at all (Telegram /disable)
+#   $CAMS_STATE/disabled exists -> nothing is published at all: no RTSP session
+#                                  to the camera, and no encoder standing in for
+#                                  it either (Telegram /disable)
 #   camera unreachable          -> "CAMERA OFFLINE"
 #   otherwise                   -> the camera, video stream-copied at its own
 #                                  quality; only the audio becomes Opus, which
 #                                  is what WebRTC needs
 #
-# The placeholders keep the path published, so the page shows a captioned panel
-# instead of a dead player and the compositor downstream never breaks.
+# Off means off: an idle publisher costs one sleeping shell, and because the path
+# goes unpublished MediaMTX stops recording it too. The page reads the same
+# switch and draws its own "cameras off" panel, so there is nothing for a
+# placeholder stream to caption. The OFFLINE placeholder stays, because there
+# one camera is still live and the compositor downstream needs both its inputs.
 #
 # Env: FF (ffmpeg), FONT (ttf for the captions; plain black without it),
 #      CAMS_STATE, CAM_USER, CAM_PASS, RTSP_PORT.
@@ -40,23 +44,21 @@ caption() {
   fi
 }
 
-# Run a publisher in the background and stop it the moment the switch flips the
-# other way, so /disable and /enable both take effect within a second.
+# Run a publisher in the background and stop it the moment the cameras are
+# switched off, so /disable takes effect within a second.
 watch_run() {
-  local want="$1"; shift
   "$@" &
   local pid=$!
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$want" = off ] && [ ! -e "$off" ]; then break; fi
-    if [ "$want" = on  ] && [   -e "$off" ]; then break; fi
+    [ -e "$off" ] && break
     sleep 1
   done
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
 }
 
-placeholder() {   # <caption> <seconds> <want>
-  watch_run "$3" "$FF" -hide_banner -loglevel warning -nostdin -re \
+placeholder() {   # <caption> <seconds>
+  watch_run "$FF" -hide_banner -loglevel warning -nostdin -re \
     -f lavfi -i "color=c=black:s=896x512:r=10" -f lavfi -i "anullsrc=r=48000:cl=stereo" \
     -vf "$(caption "$1")" -t "$2" \
     -c:v libx264 -preset ultrafast -tune stillimage -pix_fmt yuv420p -g 20 \
@@ -65,14 +67,13 @@ placeholder() {   # <caption> <seconds> <want>
 
 while true; do
   if [ -e "$off" ]; then
-    # one long still, held until /enable — no reconnect flicker while off
-    placeholder "CAMERAS OFF" 3600 off
+    while [ -e "$off" ]; do sleep 2; done    # idle: one sleeping shell, no encoder
   elif reachable; then
-    watch_run on "$FF" -hide_banner -loglevel warning -nostdin -rtsp_transport tcp \
+    watch_run "$FF" -hide_banner -loglevel warning -nostdin -rtsp_transport tcp \
       -i "$cam" -map 0 -c:v copy -c:a libopus -b:a 64k -ac 2 \
       -f rtsp -rtsp_transport tcp "$out"
   else
-    placeholder "CAMERA OFFLINE" 10 on
+    placeholder "CAMERA OFFLINE" 10
   fi
   sleep 1
 done
