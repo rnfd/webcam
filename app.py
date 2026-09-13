@@ -748,7 +748,8 @@ def _tg_set_commands():
             {"command": "record",   "description": "Start recording"},
             {"command": "stop",     "description": "Stop recording"},
             {"command": "status",   "description": "What is on right now"},
-            {"command": "clear",    "description": "Delete the bot's messages from this chat"}]
+            {"command": "clear",    "description": "Delete the bot's messages from this chat"},
+            {"command": "help",     "description": "What the commands do; /help timelapse for detail"}]
     try: _tg_api("setMyCommands", fields={"commands": _json.dumps(cmds)})
     except Exception: pass
 
@@ -770,17 +771,88 @@ def _tg_snap_reply(caption):
         except OSError: pass
     if not ok: _tg_reply(caption)
 
-HELP = ("Cameras:\n"
-        "/enable — cameras on\n"
-        "/disable — cameras off, nothing is captured\n"
-        "/follow — alert me on person / pet / motion\n"
-        "/unfollow — stop those alerts\n"
-        "/timelapse 8h 100x — film 8h and play it back 100x faster, one film\n"
-        "    per camera (/timelapse stop finishes early and still sends it)\n"
-        "/record — start recording\n"
-        "/stop — stop recording\n"
-        "/status — what is on right now\n"
-        "/clear — delete the bot's messages (Telegram allows the last 48h)")
+# /help: one source for both the overview and the per-command detail
+# (/help timelapse). Built at call time so the limits quoted are the live ones.
+HELP_TOPICS = {   # command -> (one-liner for the overview, detail for /help <command>)
+    "enable":   ("cameras on",
+                 "Wakes both cameras: restores the settings /disable saved, recalls "
+                 "each camera's saved view (twice — the head settles a few degrees off "
+                 "on the first try) and restarts the feeds. The pictures are back "
+                 "within a few seconds."),
+    "disable":  ("cameras off, nothing is captured",
+                 "Turns the cameras off as far as the network allows: saves where each "
+                 "one is looking, tilts the lens down into the base, switches off the "
+                 "camera's own recording, alerts and LEDs, and stops every feed. A "
+                 "running recording or timelapse is finished first and sent as usual. "
+                 "Nothing is captured until /enable."),
+    "follow":   ("alert me on person / pet / motion",
+                 "Sends a short clip here whenever a camera reports a person, a pet or "
+                 "motion. Independent of recording — it works whether or not you are "
+                 "recording. Needs the cameras on."),
+    "unfollow": ("stop those alerts", "Stops the detection clips. Nothing else changes."),
+    "record":   ("start recording", None),        # detail filled in below (needs the cap)
+    "stop":     ("stop recording",
+                 "Stops the recording. The file is finalised, converted to MP4, "
+                 "uploaded to Google Drive, and the link is posted here with a "
+                 "progress bar while it uploads."),
+    "timelapse":("film for hours, play it back fast, e.g. /timelapse 8h 100x", None),
+    "status":   ("what is on right now",
+                 "Replies with the current picture from both cameras and whether the "
+                 "cameras are on, whether alerts are on, whether a recording is "
+                 "running and for how long, and the progress of a timelapse if one "
+                 "is running."),
+    "clear":    ("delete the bot's messages from this chat",
+                 "Deletes every message the bot sent here in the last 48 hours — that "
+                 "is as far back as Telegram lets a bot delete. In a group the bot "
+                 "has to be an admin with \"delete messages\" to remove your /clear "
+                 "as well."),
+    "help":     ("this list; /help <command> for detail", None),
+}
+HELP_ALIASES = {"rec": "record", "start": "record", "tl": "timelapse"}
+HELP_GROUPS = [("Cameras", ["enable", "disable"]),
+               ("Alerts", ["follow", "unfollow"]),
+               ("Recording", ["record", "stop"]),
+               ("Timelapse", ["timelapse"]),
+               ("Info", ["status", "clear", "help"])]
+
+def _help_detail(cmd):
+    """Detail text for one command; the two that quote live limits are built here."""
+    if cmd == "record":
+        return ("Starts recording both cameras into one stacked video (camera 1 on top, "
+                f"camera 2 below, sound mixed). Stops by itself after {MAX_REC_SECONDS // 3600}h "
+                "or on /stop, then the clip goes to Google Drive and the link is posted "
+                "here. /rec and /start do the same thing.")
+    if cmd == "timelapse":
+        return ("/timelapse <duration> <speed>x films both cameras and speeds the result "
+                "up, one film per camera.\n\n"
+                "Duration: 8h, 90m, 45s, 2h30m, or a bare number of hours "
+                f"(up to {TL_MAX_HOURS:g}h).\n"
+                f"Speed: 100x, 60x… — either order; leave it out for {TL_SPEED:g}x. "
+                "The film runs duration ÷ speed long, so 8h at 100x gives 4m 48s "
+                f"and keeps a frame every {100 / TL_FPS:.1f}s at 100x.\n\n"
+                "/timelapse on its own shows progress: time filmed, time left, and "
+                "how much film each camera has so far.\n"
+                "/timelapse stop finishes early and still sends what it has.\n\n"
+                "A camera that drops (or /disable) just leaves a gap: filming resumes "
+                "when it is back and the pieces are joined. At the end each film goes "
+                "to Google Drive with the link posted here.\n\n"
+                "Examples: /timelapse 8h 100x · /timelapse 20m 10x · /timelapse 2 60x")
+    if cmd == "help":
+        return "/help lists the commands; /help <command> explains one, e.g. /help timelapse."
+    return HELP_TOPICS[cmd][1]
+
+def _help_text(topic=""):
+    topic = HELP_ALIASES.get(topic.lstrip("/"), topic.lstrip("/"))
+    if topic in HELP_TOPICS:
+        return f"/{topic} — {HELP_TOPICS[topic][0]}\n\n{_help_detail(topic)}"
+    lines = []
+    if topic: lines += [f"I don't know /{topic}. Here is what I understand:", ""]
+    for title, cmds in HELP_GROUPS:
+        lines.append(f"{title}:")
+        lines += [f"  /{c} — {HELP_TOPICS[c][0]}" for c in cmds]
+        lines.append("")
+    lines.append("/help <command> explains one in detail, e.g. /help timelapse.")
+    return "\n".join(lines).rstrip()
 
 def _status_lines():
     st = REC.status()
@@ -887,8 +959,10 @@ def _tg_handle(text, msg_id=None):
         msg = "\n".join(_status_lines())
         if cams_enabled(): _tg_snap_reply(msg)
         else:              _tg_reply(msg)
-    elif text == "/help":
-        _tg_reply(HELP)
+    elif text == "/help" or text.startswith("/help "):
+        _tg_reply(_help_text(text[len("/help"):].strip()))
+    elif text.startswith("/"):
+        _tg_reply(f"I don't know {text.split()[0]}. /help lists what I understand.")
 
 def _tg_get(params, read_timeout):
     import urllib.request, urllib.parse, json as _json

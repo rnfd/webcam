@@ -89,7 +89,8 @@ and `TL_MAX_HOURS` (default 24).
   driving into the tilt stop. `/follow` and `/unfollow` turn detection alerts on and
   off (independent of recording — following works whether or not you are
   recording). `/record` and `/stop` mirror the web button, `/status` says
-  what is on right now, and `/clear` deletes the bot's messages from the chat —
+  what is on right now, `/help` lists the commands (`/help timelapse` explains
+  one in detail), and `/clear` deletes the bot's messages from the chat —
   every one it sent in the last 48 hours, which is as far back as Telegram lets a
   bot delete (it notes what it sends in `tg-sent.json`, since a bot cannot read
   chat history). Both switches are files in `/var/lib/cams-state`, shared
