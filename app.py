@@ -923,7 +923,13 @@ def _tg_command_loop():
                     print(f"telegram: ignoring a message from chat {m.get('chat', {}).get('id')} "
                           f"({m.get('chat', {}).get('type')}); only {TG_CHAT} is listened to")
                     continue                                  # owner only
-                text = (m.get("text") or "").strip().lower().split("@")[0]
+                # "/timelapse@bot_name 8h 100x" is how Telegram sends a command
+                # picked from the menu in a group: drop only the @mention on the
+                # command word, never what follows it.
+                text = (m.get("text") or "").strip().lower()
+                if text.startswith("/"):
+                    cmd, _, rest = text.partition(" ")
+                    text = (cmd.split("@")[0] + " " + rest).strip()
                 print(f"telegram: got {text or '(no text)'!r}")
                 if not text:
                     continue
