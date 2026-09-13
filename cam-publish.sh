@@ -15,6 +15,13 @@
 #                                  quality; only the audio becomes Opus, which
 #                                  is what WebRTC needs
 #
+# The camera input carries a socket timeout (STALL_TIMEOUT, default 10 s). Without
+# it an RTSP-over-TCP read blocks forever when a camera reboots or the Wi-Fi
+# drops mid-stream: the TCP session stays "established", ffmpeg sits in the read,
+# MediaMTX drops the silent publisher after readTimeout, and the path stays dead
+# until someone kills the process by hand — it does not even answer SIGTERM in
+# that state, which is why the stop below escalates to SIGKILL.
+#
 # Off means off: an idle publisher costs one sleeping shell, and because the path
 # goes unpublished MediaMTX stops recording it too. The page reads the same
 # switch and draws its own "cameras off" panel, so there is nothing for a
@@ -22,7 +29,7 @@
 # one camera is still live and the compositor downstream needs both its inputs.
 #
 # Env: FF (ffmpeg), FONT (ttf for the captions; plain black without it),
-#      CAMS_STATE, CAM_USER, CAM_PASS, RTSP_PORT.
+#      CAMS_STATE, CAM_USER, CAM_PASS, RTSP_PORT, STALL_TIMEOUT (seconds).
 set -u
 ip="$1"; path="$2"; variant="$3"
 
@@ -32,6 +39,7 @@ STATE="${CAMS_STATE:-./state}"
 off="$STATE/disabled"
 user="${CAM_USER:-admin}"; pass="${CAM_PASS:-}"
 port="${RTSP_PORT:-8554}"
+stall_us=$(( ${STALL_TIMEOUT:-10} * 1000000 ))   # ffmpeg wants microseconds
 out="rtsp://localhost:$port/$path"
 cam="rtsp://$user:$pass@$ip:554/h264Preview_01_$variant"
 
@@ -53,7 +61,11 @@ watch_run() {
     [ -e "$off" ] && break
     sleep 1
   done
+  # TERM first; a process still alive 3 s later is wedged in a socket read
+  # (see above) and only KILL gets it out.
   kill "$pid" 2>/dev/null || true
+  for _ in 1 2 3; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  kill -9 "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
 }
 
@@ -70,7 +82,7 @@ while true; do
     while [ -e "$off" ]; do sleep 2; done    # idle: one sleeping shell, no encoder
   elif reachable; then
     watch_run "$FF" -hide_banner -loglevel warning -nostdin -rtsp_transport tcp \
-      -i "$cam" -map 0 -c:v copy -c:a libopus -b:a 64k -ac 2 \
+      -timeout "$stall_us" -i "$cam" -map 0 -c:v copy -c:a libopus -b:a 64k -ac 2 \
       -f rtsp -rtsp_transport tcp "$out"
   else
     placeholder "CAMERA OFFLINE" 10
