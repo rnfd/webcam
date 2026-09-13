@@ -17,8 +17,9 @@ NixOS services.
 | `snap.py` | One-off JPEG snapshot from a camera |
 
 Environment knobs worth knowing: `PTZ_SPEED` (default 32), `PTZ_MAX_MOVE`
-(seconds a pan/tilt may run without a release, default 4), `TL_PRE`/`TL_POST`
-(seconds kept around each sighting, default 5 each), `TL_MAX_CLIPS` (default 600)
+(seconds a pan/tilt may run without a release, default 4), `TL_SPEED` (speed-up
+when `/timelapse` names none, default 100), `TL_FPS` (film frame rate, default
+30), `TL_WIDTH`/`TL_HEIGHT` (film size, default 1920x1078), `TL_CRF` (default 23)
 and `TL_MAX_HOURS` (default 24).
 
 ## How it works
@@ -60,16 +61,17 @@ and `TL_MAX_HOURS` (default 24).
   combined. Stop finalizes the file, then in the background it
   remuxes to MP4, uploads to Google Drive (rclone), and posts a link to Telegram
   with an upload progress bar. Recordings auto-stop after 8 hours.
-- **Timelapse of the dog:** `/timelapse 8h` watches both cameras for the dog and
-  keeps only the moments it appears — each sighting copies `[t-5s, t+5s]` out of
-  the rolling HD buffer MediaMTX keeps, so the seconds *before* the dog walked in
-  are there too. Windows never overlap (one every 10 s per camera at most, capped
-  at `TL_MAX_CLIPS`). At the end, each camera's clips are concatenated with a
-  stream copy — no re-encode, seconds to assemble — and uploaded to Google Drive
-  as one film per camera, with the link posted to Telegram. `/timelapse stop`
-  ends it early and still delivers what it caught; `/timelapse` on its own reports
-  progress. The dog/cat class ships **disabled** on these cameras, so the session
-  turns it on (`SetAiCfg`) and says so.
+- **Timelapse:** `/timelapse 8h 100x` films both cameras for 8 hours and plays
+  it back 100 times faster — 4m 48s of film per camera. One ffmpeg per camera
+  reads the HD stream live and keeps a frame every speed ÷ fps seconds (3.3 s
+  here), encoding it straight into the film, so nothing piles up on disk. It
+  decodes every frame rather than just keyframes (those come every 2 s, which
+  would make the film stutter); that costs about a fifth of a core per camera.
+  A camera that drops, or `/disable`, ends that camera's current piece and a new
+  one starts when it is back; the pieces share one encoding and size, so they
+  join with a stream copy. At the end each camera's film goes to Google Drive
+  with the link posted to Telegram. `/timelapse stop` finishes early and still
+  sends what it has; `/timelapse` on its own reports progress.
 - **Control:** the web button records; the Telegram bot carries the rest.
   `/enable` and `/disable` are the master switch. `/disable` turns the cameras
   themselves off as far as the network allows — there is no power or sleep command
@@ -86,8 +88,11 @@ and `TL_MAX_HOURS` (default 24).
   twice, because the head settles a few degrees off on the first recall after
   driving into the tilt stop. `/follow` and `/unfollow` turn detection alerts on and
   off (independent of recording — following works whether or not you are
-  recording). `/record` and `/stop` mirror the web button, and `/status` says
-  what is on right now. Both switches are files in `/var/lib/cams-state`, shared
+  recording). `/record` and `/stop` mirror the web button, `/status` says
+  what is on right now, and `/clear` deletes the bot's messages from the chat —
+  every one it sent in the last 48 hours, which is as far back as Telegram lets a
+  bot delete (it notes what it sends in `tg-sent.json`, since a bot cannot read
+  chat history). Both switches are files in `/var/lib/cams-state`, shared
   with the MediaMTX service through the `cams` group, so they survive a restart.
 
 ## Configuration

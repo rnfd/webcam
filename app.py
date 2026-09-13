@@ -134,7 +134,62 @@ def _tg_api(method, boundary=None, body=None, fields=None):
     else:
         req = urllib.request.Request(url, data=urllib.parse.urlencode(fields or {}).encode())
     import json as _json
-    return _json.loads(urllib.request.urlopen(req, timeout=120).read().decode())
+    r = _json.loads(urllib.request.urlopen(req, timeout=120).read().decode())
+    if method in _TG_SENDS and r.get("ok"): _tg_remember(r["result"])
+    return r
+
+# /clear needs to know what the bot has posted, and the Bot API offers no way to
+# read a chat's history — so every message the bot sends is noted here (chat,
+# message id, time) in the state dir, where it survives a restart. Telegram only
+# lets a bot delete a message for 48 hours, so older entries are dropped.
+_TG_SENDS = {"sendMessage", "sendPhoto", "sendVideo"}
+_TG_SENT = "tg-sent.json"
+TG_DELETE_WINDOW = 48 * 3600
+_tg_sent_lock = threading.Lock()
+
+def _tg_sent_load():
+    try:
+        with open(_flag(_TG_SENT)) as f: return json.load(f)
+    except Exception:
+        return []
+
+def _tg_sent_save(items):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = _flag(_TG_SENT + ".tmp")
+        with open(tmp, "w") as f: json.dump(items, f)
+        os.replace(tmp, _flag(_TG_SENT))
+    except OSError as e:
+        print("telegram: cannot note sent message:", e)
+
+def _tg_remember(msg):
+    now = time.time()
+    with _tg_sent_lock:
+        items = [x for x in _tg_sent_load() if now - x[2] < TG_DELETE_WINDOW]
+        items.append([msg["chat"]["id"], msg["message_id"], msg.get("date", now)])
+        _tg_sent_save(items)
+
+def _tg_clear():
+    """Delete everything the bot has posted in this chat that can still be
+    deleted. Returns (deleted, failed)."""
+    now = time.time()
+    with _tg_sent_lock:
+        ids = sorted(x[1] for x in _tg_sent_load()
+                     if str(x[0]) == str(TG_CHAT) and now - x[2] < TG_DELETE_WINDOW)
+    done = []
+    for i in range(0, len(ids), 100):                 # deleteMessages takes 100 at a time
+        chunk = ids[i:i+100]
+        try:
+            if _tg_api("deleteMessages", fields={"chat_id": TG_CHAT,
+                                                 "message_ids": json.dumps(chunk)}).get("ok"):
+                done += chunk
+        except Exception as e:
+            print("telegram: delete failed:", e)
+    with _tg_sent_lock:
+        gone = set(done)
+        _tg_sent_save([x for x in _tg_sent_load()
+                       if not (str(x[0]) == str(TG_CHAT) and x[1] in gone)])
+    return len(done), len(ids) - len(done)
 
 def _tg_multipart(fields, file_field, filepath, ctype="video/mp4"):
     b = _uuid.uuid4().hex
@@ -298,6 +353,20 @@ def _cam_paths():
     """Record the single stacked composite (resilient: black pane if a cam is down)."""
     return [("composite", "Cameras")]
 
+def _stop_ffmpeg(p):
+    """Ask ffmpeg to finish its file cleanly; force it only if it will not."""
+    if not p or p.poll() is not None: return
+    try:
+        if p.stdin: p.stdin.write(b"q"); p.stdin.flush()
+    except Exception: pass
+    try: p.send_signal(signal.SIGINT)
+    except Exception: pass
+    try: p.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        p.terminate()
+        try: p.wait(timeout=4)
+        except subprocess.TimeoutExpired: p.kill()
+
 class Recorder:
     """Records each camera independently, so one camera failing never stops the
     others. A session is 'recording' while any per-camera recorder is alive."""
@@ -359,18 +428,7 @@ class Recorder:
         if not sess: return {"recording": False, "cams": 0, "elapsed": 0}
         elapsed = int(time.time()-st) if st else 0
         for s in sess:
-            p = s["proc"]
-            if p and p.poll() is None:
-                try:
-                    if p.stdin: p.stdin.write(b"q"); p.stdin.flush()
-                except Exception: pass
-                try: p.send_signal(signal.SIGINT)
-                except Exception: pass
-                try: p.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    p.terminate()
-                    try: p.wait(timeout=4)
-                    except subprocess.TimeoutExpired: p.kill()
+            _stop_ffmpeg(s["proc"])
             # upload each camera's file (if it captured anything)
             if _any_sink() and os.path.exists(s["mkv"]) and os.path.getsize(s["mkv"]) > 2000:
                 threading.Thread(target=_post_record, args=(s["mkv"], elapsed),
@@ -686,10 +744,11 @@ def _tg_set_commands():
             {"command": "disable",  "description": "Cameras off — nothing is captured"},
             {"command": "follow",   "description": "Alert me on person / pet / motion"},
             {"command": "unfollow", "description": "Stop detection alerts"},
-            {"command": "timelapse","description": "e.g. /timelapse 8h — keep only the dog moments"},
+            {"command": "timelapse","description": "e.g. /timelapse 8h 100x — film 8h, play it 100x faster"},
             {"command": "record",   "description": "Start recording"},
             {"command": "stop",     "description": "Stop recording"},
-            {"command": "status",   "description": "What is on right now"}]
+            {"command": "status",   "description": "What is on right now"},
+            {"command": "clear",    "description": "Delete the bot's messages from this chat"}]
     try: _tg_api("setMyCommands", fields={"commands": _json.dumps(cmds)})
     except Exception: pass
 
@@ -716,24 +775,53 @@ HELP = ("Cameras:\n"
         "/disable — cameras off, nothing is captured\n"
         "/follow — alert me on person / pet / motion\n"
         "/unfollow — stop those alerts\n"
-        "/timelapse 8h — watch for the dog for 8h, keep ±5s around each\n"
-        "    sighting, then send one film per camera (/timelapse stop ends it)\n"
+        "/timelapse 8h 100x — film 8h and play it back 100x faster, one film\n"
+        "    per camera (/timelapse stop finishes early and still sends it)\n"
         "/record — start recording\n"
         "/stop — stop recording\n"
-        "/status — what is on right now")
+        "/status — what is on right now\n"
+        "/clear — delete the bot's messages (Telegram allows the last 48h)")
 
 def _status_lines():
     st = REC.status()
     return [("📷 Cameras on" if st["enabled"] else "⏸ Cameras off — lenses parked, nothing is captured"),
             ("👁 Following detections" if st["follow"] else "🚫 Not following detections"),
             (f"🔴 Recording {_dur(st['elapsed'])}" if st["recording"] else "⏹ Not recording")] + (
-           [f"🎞 Timelapse running · {_dur(tl['elapsed'])} in, {_dur(tl['left'])} left · "
-            + ", ".join(f"{nm} {k}" for nm, k in tl["clips"].items()) + " clips"]
-           if (tl := TL.status())["active"] else [])
+           [_tl_status_line(tl)] if (tl := TL.status())["active"] else [])
 
-def _tg_handle(text):
+def _tl_status_line(tl):
+    return (f"🎞 Timelapse {tl['speed']:g}x · {_span(tl['elapsed'])} in, {_span(tl['left'])} left · film so far "
+            + ", ".join(f"{nm} {_span(f)}" for nm, f in tl["film"].items()))
+
+def _tg_note(text, secs=5):
+    """A reply that removes itself after a few seconds, so /clear leaves the chat
+    clean instead of leaving its own confirmation behind."""
+    try: r = _tg_api("sendMessage", fields={"chat_id": TG_CHAT, "text": text})
+    except Exception as e: print("telegram: reply failed:", e); return
+    mid = r.get("result", {}).get("message_id") if r.get("ok") else None
+    if mid:
+        def drop():
+            try: _tg_api("deleteMessage", fields={"chat_id": TG_CHAT, "message_id": mid})
+            except Exception: pass
+        t = threading.Timer(secs, drop); t.daemon = True; t.start()
+
+def _tg_handle(text, msg_id=None):
     """Run one command; may block (record/stop/snapshot), so it runs off the poll loop."""
-    if text == "/enable":
+    if text == "/clear":
+        # the command itself goes too; in a group that needs the bot to be an
+        # admin with "delete messages", and it is simply left there otherwise
+        if msg_id:
+            try: _tg_api("deleteMessage", fields={"chat_id": TG_CHAT, "message_id": msg_id})
+            except Exception as e:
+                why = e.read().decode(errors="replace") if hasattr(e, "read") else e
+                print(f"telegram: cannot delete the /clear command ({msg_id}): {why}")
+        n, failed = _tg_clear()
+        if failed:
+            _tg_reply(f"⚠️ Deleted {n}, but {failed} could not be deleted.")
+        else:
+            _tg_note(f"🧹 Deleted {n} message{'s' if n != 1 else ''}." if n
+                     else "🧹 Nothing to delete (Telegram only allows the last 48 hours).")
+    elif text == "/enable":
         _tg_reply("📷 Waking the cameras — putting the lenses back…")
         failed = _cameras_on()                 # settings back, lens back to its view
         if not _flag_set("disabled", False):
@@ -742,7 +830,7 @@ def _tg_handle(text):
         if failed: msg += "\n⚠️ Could not restore the view on: " + ", ".join(failed)
         _tg_reply(msg)
     elif text == "/disable":
-        if TL.status()["active"]: TL.stop()      # nothing to watch with the lenses parked
+        if TL.status()["active"]: TL.stop()      # nothing to film with the lenses parked; sends what it has
         if REC.status().get("recording"): REC.stop()
         if not _flag_set("disabled", True):    # stop the feeds first, then the cameras
             _tg_reply("⚠️ Could not disable (state dir not writable)."); return
@@ -761,32 +849,28 @@ def _tg_handle(text):
         _tg_reply("🚫 Not following detections any more.")
     elif text.startswith("/timelapse"):
         arg = text[len("/timelapse"):].strip()
-        if arg in ("stop", "off", "cancel"):
+        if arg in ("stop", "off", "cancel", "done", "finish", "now"):
             r = TL.stop()
-            _tg_reply("🎞 Stopping the timelapse — assembling and uploading what it caught…"
+            _tg_reply("🎞 Finishing the timelapse now — building the film from what it has…"
                       if r["ok"] else f"⚠️ {r['error']}.")
         elif not arg:
             tl = TL.status()
-            if tl["active"]:
-                _tg_reply(f"🎞 Running · {_dur(tl['elapsed'])} in, {_dur(tl['left'])} left · "
-                          + ", ".join(f"{nm}: {k}" for nm, k in tl["clips"].items()) + " clips")
-            else:
-                _tg_reply("No timelapse running. Start one with e.g. /timelapse 8h.")
+            _tg_reply(_tl_status_line(tl) if tl["active"]
+                      else "No timelapse running. Start one with e.g. /timelapse 8h 100x.")
         else:
-            secs = _parse_duration(arg)
+            secs, speed = _parse_timelapse(arg)
             if not secs or secs <= 0:
-                _tg_reply("⚠️ I need a duration, e.g. /timelapse 8h, /timelapse 90m, "
-                          "or /timelapse stop."); return
+                _tg_reply("⚠️ I need a duration and a speed, e.g. /timelapse 8h 100x, "
+                          "/timelapse 90m 60x, or /timelapse stop."); return
+            if speed < 2:
+                _tg_reply("⚠️ The speed-up has to be at least 2x."); return
             if secs > TL_MAX_HOURS * 3600:
                 _tg_reply(f"⚠️ That is longer than the {TL_MAX_HOURS:g}h limit."); return
-            r = TL.start(secs)
+            r = TL.start(secs, speed)
             if not r["ok"]: _tg_reply(f"⚠️ Could not start: {r['error']}."); return
-            msg = (f"🎞 Timelapse for {_dur(int(secs))} — watching both cameras for the dog, "
-                   f"keeping ±{TL_PRE:g}s around every sighting. "
-                   f"One film per camera to Drive at the end; /timelapse stop ends it early.")
-            if r["enabled_dog_on"]:
-                msg += "\n(Dog detection was off on " + ", ".join(r["enabled_dog_on"]) + "; I turned it on.)"
-            _tg_reply(msg)
+            _tg_reply(f"🎞 Timelapse started — {_span(secs)} at {speed:g}x, a frame every "
+                      f"{speed / TL_FPS:.1f}s. Each camera's film will run about "
+                      f"{_span(secs / speed)}. /timelapse stop finishes it early.")
     elif text in ("/record", "/rec", "/start"):
         was = REC.status().get("recording")     # start() returns the live state either way
         st = REC.start()
@@ -836,15 +920,19 @@ def _tg_command_loop():
                 offset = upd["update_id"] + 1
                 m = upd.get("message") or {}
                 if str(m.get("chat", {}).get("id")) != str(TG_CHAT):
+                    print(f"telegram: ignoring a message from chat {m.get('chat', {}).get('id')} "
+                          f"({m.get('chat', {}).get('type')}); only {TG_CHAT} is listened to")
                     continue                                  # owner only
                 text = (m.get("text") or "").strip().lower().split("@")[0]
+                print(f"telegram: got {text or '(no text)'!r}")
                 if not text:
                     continue
                 age = time.time() - m.get("date", time.time())
                 if age > STALE_SECONDS:
                     print(f"telegram: skipping stale {text!r} ({age:.0f}s old)")
                     continue
-                threading.Thread(target=_tg_handle, args=(text,), daemon=True).start()
+                threading.Thread(target=_tg_handle, args=(text, m.get("message_id")),
+                                 daemon=True).start()
         except urllib.error.HTTPError as e:
             # 409 = another getUpdates consumer (e.g. brief overlap on restart)
             print("telegram: getUpdates conflict, backing off" if e.code == 409
@@ -1145,15 +1233,24 @@ def _motion_watch():
             print("motion: loop error:", e); time.sleep(5)
 
 # ------------------------------- /timelapse --------------------------------
-# Watch each camera for the dog, and keep only the seconds around each sighting:
-# every detection copies [t-5s, t+5s] out of the rolling buffer MediaMTX already
-# keeps, so the five seconds *before* the dog appeared are there too. At the end
-# the pieces are concatenated per camera — stream-copied, so no quality is lost
-# and assembly takes seconds — and each camera's film goes to Google Drive.
-TL_PRE   = float(os.environ.get("TL_PRE", "5"))
-TL_POST  = float(os.environ.get("TL_POST", "5"))
-TL_PATH  = os.environ.get("TL_PATH", "cam{n}")      # HD buffer ({n} = camera number)
-TL_MAX_CLIPS = int(os.environ.get("TL_MAX_CLIPS", "600"))   # ~100 min of footage
+# A plain timelapse: /timelapse 8h 100x watches each camera for 8 hours and
+# turns it into a film 100 times shorter (8h -> 4m48s). One ffmpeg per camera
+# reads the HD path and keeps one frame every speed/fps seconds (100x at 30 fps
+# is a frame every 3.3 s), encoding straight into the film as the frames
+# arrive, so nothing piles up on disk and the end of a session only has to join
+# the pieces. It decodes every frame rather than just keyframes: the cameras
+# put one every 2 s, and sampling from those would make the film stutter.
+#
+# A camera that drops, or /disable, ends that camera's current piece; a new one
+# starts when it is back. Every piece is encoded the same way and at the same
+# size, so they join with a stream copy. /timelapse stop finishes early and
+# still delivers what it has.
+TL_FPS    = int(os.environ.get("TL_FPS", "30"))        # film frame rate
+TL_SPEED  = float(os.environ.get("TL_SPEED", "100"))   # when the command names none
+TL_WIDTH  = int(os.environ.get("TL_WIDTH", "1920"))    # film size; the HD stream is
+TL_HEIGHT = int(os.environ.get("TL_HEIGHT", "1078"))   # 2880x1616, same shape
+TL_CRF    = os.environ.get("TL_CRF", "23")
+TL_PATH   = os.environ.get("TL_PATH", "cam{n}")        # HD path ({n} = camera number)
 TL_MAX_HOURS = float(os.environ.get("TL_MAX_HOURS", "24"))
 
 def _parse_duration(text):
@@ -1165,24 +1262,21 @@ def _parse_duration(text):
     if not parts or re.sub(r"\d|\.|\s|[hms]", "", t): return None
     return sum(float(v) * {"h": 3600, "m": 60, "s": 1}[u] for v, u in parts)
 
-def _buffer_grab(path, start_epoch, duration, out_path):
-    """Copy a window out of MediaMTX's rolling recording, keeping it as it was
-    recorded (no re-encode)."""
-    import urllib.request, urllib.parse, datetime, tempfile
-    start = datetime.datetime.fromtimestamp(start_epoch, datetime.timezone.utc)
-    url = PLAYBACK + "/get?" + urllib.parse.urlencode(
-        {"path": path, "start": start.isoformat().replace("+00:00", "Z"), "duration": duration})
-    fd, raw = tempfile.mkstemp(suffix=".mp4"); os.close(fd)
-    try:
-        with open(raw, "wb") as f: f.write(urllib.request.urlopen(url, timeout=60).read())
-        subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-i", raw, "-c", "copy",
-                        "-movflags", "+faststart", out_path], check=True, timeout=120)
-        return os.path.getsize(out_path) > 2000
-    except Exception as e:
-        print("timelapse: clip fetch failed:", e); return False
-    finally:
-        try: os.remove(raw)
-        except OSError: pass
+def _parse_timelapse(arg):
+    """'8h 100x' (either order, speed optional) -> (seconds or None, speed)."""
+    import re
+    speed = TL_SPEED
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[x×]", arg)
+    if m:
+        speed = float(m.group(1)); arg = arg[:m.start()] + arg[m.end():]
+    return _parse_duration(arg), speed
+
+def _span(secs):
+    """28800 -> '8h 00m', 288 -> '4m 48s', 42 -> '42s'."""
+    s = int(round(secs))
+    if s >= 3600: return f"{s//3600}h {s%3600//60:02d}m"
+    if s >= 60:   return f"{s//60}m {s%60:02d}s"
+    return f"{s}s"
 
 def _concat(files, out_path):
     lst = out_path + ".txt"
@@ -1199,50 +1293,146 @@ def _concat(files, out_path):
         try: os.remove(lst)
         except OSError: pass
 
-def _enable_dog_detection():
-    """The dog class ships disabled on these cameras; without it nothing triggers."""
-    turned_on = []
-    for ip, name in CAMS:
-        try:
-            cfg = _cam_api(ip, [{"cmd": "GetAiCfg", "action": 0, "param": {"channel": 0}}])[0]["value"]
-            if cfg.get("AiDetectType", {}).get("dog_cat"): continue
-            want = dict(cfg); want["AiDetectType"] = dict(cfg["AiDetectType"], dog_cat=1)
-            _cam_api(ip, [{"cmd": "SetAiCfg", "action": 0, "param": want}])
-            turned_on.append(name)
-        except Exception as e:
-            print(f"timelapse: could not enable dog detection on {name}: {e}")
-    return turned_on
+_TL_META = "session.json"
+
+def _tl_pieces(sess_dir, n):
+    """Camera n's pieces in a session, in order — whatever reached the disk,
+    including a piece cut short by a restart (MPEG-TS stays readable)."""
+    return [f for f in sorted(glob.glob(os.path.join(sess_dir, f"cam{n}_*.ts")))
+            if os.path.getsize(f) > 2000]
+
+def _film_secs(path):
+    """Length of a finished film, from its frame count."""
+    import re
+    try:
+        r = subprocess.run([FFMPEG, "-nostdin", "-loglevel", "error", "-stats", "-i", path,
+                            "-map", "0:v", "-c", "copy", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=300)
+        return int(re.findall(r"frame=\s*(\d+)", r.stderr)[-1]) / TL_FPS
+    except Exception:
+        return 0
+
+def _tl_deliver(sess_dir, speed, real, how="finished"):
+    """Join each camera's pieces into one film, send the films, drop the session."""
+    made = []
+    for i, (_ip, name) in enumerate(CAMS, 1):
+        files = _tl_pieces(sess_dir, i)
+        if not files: continue
+        out = os.path.join(REC_DIR, f"{os.path.basename(sess_dir)}_cam{i}.mp4")
+        if _concat(files, out):
+            made.append((name, out, _film_secs(out)))
+    if _tg_enabled():
+        at = f" — {_span(real)} at {speed:g}x" if speed and real else ""
+        if made:
+            _tg_reply(f"🎞 Timelapse {how}{at}. "
+                      + ", ".join(f"{nm}: {_span(film)} film" for nm, _p, film in made)
+                      + ".\nUploading…")
+        else:
+            _tg_reply(f"🎞 Timelapse {how} with nothing filmed (were the cameras off?).")
+    for _nm, path, film in made:
+        try: _deliver(path, int(film))
+        finally:
+            try: os.path.exists(path) and os.remove(path)
+            except OSError: pass
+    shutil.rmtree(sess_dir, ignore_errors=True)
+    print(f"timelapse: {os.path.basename(sess_dir)} delivered")
 
 class Timelapse:
-    """One session across all cameras; each camera collects its own clips."""
+    """One session across all cameras; each camera makes its own film.
+
+    The session lives on disk as well as here: its pieces, and a session.json
+    with the deadline and speed, sit in its directory until the films are sent.
+    So a restart of the app (a deploy, a crash) does not lose it — recover()
+    picks a session with time left back up where it was, and finishes and
+    sends one whose time ran out while the app was down."""
     def __init__(self):
         self.lock = threading.Lock()
-        self.active = False; self.started = 0.0; self.until = 0.0
-        self.dir = None; self.clips = {}; self.thread = None
-        self.stop_evt = threading.Event(); self.jobs = []
+        self.active = False; self.started = 0.0; self.until = 0.0; self.speed = TL_SPEED
+        self.dir = None; self.captured = {}; self.live = {}
+        self.stop_evt = threading.Event()
 
     def status(self):
         with self.lock:
             if not self.active: return {"active": False}
-            return {"active": True, "elapsed": int(time.time() - self.started),
-                    "left": max(0, int(self.until - time.time())),
-                    "clips": {n: len(v) for n, v in self.clips.items()}}
+            now = time.time()
+            # real time filmed so far, including the piece still being written
+            shot = {nm: self.captured[nm] + (now - self.live[nm] if self.live[nm] else 0)
+                    for nm in self.captured}
+            return {"active": True, "elapsed": int(now - self.started),
+                    "left": max(0, int(self.until - now)), "speed": self.speed,
+                    "film": {nm: s / self.speed for nm, s in shot.items()}}
 
-    def start(self, secs):
+    def _save(self):
+        """Write the session's state next to its pieces (caller holds the lock)."""
+        meta = {"started": self.started, "until": self.until, "speed": self.speed,
+                "captured": self.captured, "live": self.live}
+        try:
+            tmp = os.path.join(self.dir, _TL_META + ".tmp")
+            with open(tmp, "w") as f: json.dump(meta, f)
+            os.replace(tmp, os.path.join(self.dir, _TL_META))
+        except OSError as e:
+            print("timelapse: cannot save session:", e)
+
+    def _begin(self, sess_dir, started, until, speed, captured=None):
+        names = [name for _ip, name in CAMS]
+        self.dir = sess_dir
+        self.captured = {nm: float((captured or {}).get(nm, 0)) for nm in names}
+        self.live = {nm: None for nm in names}
+        self.active = True; self.started = started; self.until = until; self.speed = speed
+        self.stop_evt.clear()
+        self._save()
+
+    def start(self, secs, speed):
         with self.lock:
             if self.active: return {"ok": False, "error": "a timelapse is already running"}
             if not cams_enabled(): return {"ok": False, "error": "cameras are disabled"}
             if not CAMS: return {"ok": False, "error": "no cameras configured"}
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            self.dir = os.path.join(REC_DIR, f"timelapse_{ts}")
-            try: os.makedirs(self.dir, exist_ok=True)
-            except OSError as e: return {"ok": False, "error": f"cannot create {self.dir}: {e}"}
-            self.clips = {name: [] for _ip, name in CAMS}
-            self.active = True; self.started = time.time(); self.until = self.started + secs
-            self.stop_evt.clear(); self.jobs = []
-        enabled = _enable_dog_detection()
-        self.thread = threading.Thread(target=self._watch, daemon=True); self.thread.start()
-        return {"ok": True, "secs": secs, "enabled_dog_on": enabled}
+            sess_dir = os.path.join(REC_DIR, "timelapse_" + time.strftime("%Y%m%d_%H%M%S"))
+            try: os.makedirs(sess_dir, exist_ok=True)
+            except OSError as e: return {"ok": False, "error": f"cannot create {sess_dir}: {e}"}
+            now = time.time()
+            self._begin(sess_dir, now, now + secs, speed)
+        threading.Thread(target=self._run, daemon=True).start()
+        return {"ok": True}
+
+    def recover(self):
+        """After a restart: resume the newest session that still has time left;
+        finish and send every other one left on disk."""
+        now, resume, finish = time.time(), None, []
+        for d in sorted(glob.glob(os.path.join(REC_DIR, "timelapse_*")), reverse=True):
+            if not os.path.isdir(d): continue
+            try:
+                with open(os.path.join(d, _TL_META)) as f: meta = json.load(f)
+            except Exception:
+                meta = None                    # no state saved: can only be finished
+            if meta and resume is None and CAMS and meta["until"] - now > 60:
+                resume = (d, meta)
+            else:
+                finish.append((d, meta))
+        if resume:
+            d, meta = resume
+            # a piece the restart cut short counts up to its last write
+            captured = dict(meta.get("captured") or {})
+            for nm, t0 in (meta.get("live") or {}).items():
+                if not t0: continue
+                i = next((i for i, (_ip, n) in enumerate(CAMS, 1) if n == nm), None)
+                pieces = _tl_pieces(d, i) if i else []
+                if pieces:
+                    captured[nm] = captured.get(nm, 0) + max(0, os.path.getmtime(pieces[-1]) - t0)
+            with self.lock:
+                self._begin(d, meta["started"], meta["until"], meta["speed"], captured)
+            print(f"timelapse: resumed {os.path.basename(d)}, {_span(meta['until'] - now)} left")
+            if _tg_enabled():
+                _tg_reply(f"🎞 The app restarted mid-timelapse — resumed, "
+                          f"{_span(meta['until'] - now)} left at {meta['speed']:g}x.")
+            threading.Thread(target=self._run, daemon=True).start()
+        def finish_all():
+            for d, meta in finish:
+                print(f"timelapse: finishing {os.path.basename(d)} left by a restart")
+                end = min(now, meta["until"]) if meta else 0
+                _tl_deliver(d, meta and meta["speed"], meta and end - meta["started"],
+                            how="finished (the app restarted while it ran)")
+        if finish: threading.Thread(target=finish_all, daemon=True).start()
 
     def stop(self):
         with self.lock:
@@ -1250,69 +1440,68 @@ class Timelapse:
         self.stop_evt.set()
         return {"ok": True}
 
-    def _watch(self):
-        """Poll each camera for the dog; grab a window around every sighting."""
-        last = {}
-        gap = TL_PRE + TL_POST                    # never overlap two windows
-        print("timelapse: watching for the dog")
-        while not self.stop_evt.is_set():
-            now = time.time()
-            if now >= self.until: break
-            if cams_enabled():
-                for i, (ip, name) in enumerate(CAMS, 1):
-                    with self.lock: n_clips = sum(len(v) for v in self.clips.values())
-                    if n_clips >= TL_MAX_CLIPS:
-                        print("timelapse: clip cap reached"); self.stop_evt.set(); break
-                    try: hit = "pet" in _cam_detections(ip)
-                    except Exception: hit = False
-                    if hit and now - last.get(name, 0) > gap:
-                        last[name] = now
-                        t = threading.Thread(target=self._capture, args=(i, name, now), daemon=True)
-                        t.start()
-                        with self.lock: self.jobs.append(t)
-            self.stop_evt.wait(2)
-        self._finish()
+    def _over(self):
+        return self.stop_evt.is_set() or time.time() >= self.until
 
-    def _capture(self, n, name, det_epoch):
-        time.sleep(TL_POST + 1.5)                 # let the tail of the window record
+    def _run(self):
+        ts = [threading.Thread(target=self._film, args=(i, name), daemon=True)
+              for i, (_ip, name) in enumerate(CAMS, 1)]
+        print(f"timelapse: running at {self.speed:g}x")
+        for t in ts: t.start()
+        for t in ts: t.join()
         with self.lock:
-            if self.dir is None: return
-            seq = len(self.clips[name]) + 1
-            out = os.path.join(self.dir, f"cam{n}_{seq:04d}.mp4")
-        if _buffer_grab(TL_PATH.replace("{n}", str(n)), det_epoch - TL_PRE, TL_PRE + TL_POST, out):
-            with self.lock: self.clips[name].append(out)
-            print(f"timelapse: {name} +1 clip ({seq})")
-
-    def _finish(self):
-        with self.lock:
-            jobs, clips, sess_dir = list(self.jobs), dict(self.clips), self.dir
-            elapsed = int(time.time() - self.started)
-        for t in jobs: t.join(TL_POST + 60)       # let in-flight grabs land
-        with self.lock:
-            clips = dict(self.clips)
+            sess_dir, speed = self.dir, self.speed
+            real = min(time.time(), self.until) - self.started
             self.active = False; self.dir = None
-        made = []
-        for i, (_ip, name) in enumerate(CAMS, 1):
-            files = clips.get(name) or []
-            if not files: continue
-            out = os.path.join(REC_DIR, f"{os.path.basename(sess_dir)}_cam{i}.mp4")
-            if _concat(files, out):
-                made.append((name, out, len(files)))
-        if _tg_enabled():
-            if made:
-                _tg_reply("🎞 Timelapse finished — " + ", ".join(
-                    f"{nm}: {k} clip{'s' if k != 1 else ''}" for nm, _p, k in made)
-                    + ".\nUploading…")
+        _tl_deliver(sess_dir, speed, real)
+
+    def _film(self, n, name):
+        """Keep one camera's film going until the session ends: one piece per
+        uninterrupted run of the camera."""
+        src = "rtsp://localhost:8554/" + TL_PATH.replace("{n}", str(n))
+        W, H = TL_WIDTH, TL_HEIGHT
+        # fps keeps one frame per interval; settb+setpts lay them out one film
+        # frame apart (setpts alone would round to the interval's coarse
+        # timebase and bunch them up); the fixed size means an OFFLINE
+        # placeholder (a different size) cannot break the join. Pieces are
+        # MPEG-TS so one cut short by a crash is still readable.
+        vf = (f"fps={TL_FPS}/{self.speed:g},settb=1/{TL_FPS},setpts=N,"
+              f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+              f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1")
+        k, fails = len(glob.glob(os.path.join(self.dir, f"cam{n}_*.ts"))), 0
+        while not self._over():
+            if not cams_enabled():
+                self.stop_evt.wait(2); continue
+            k += 1
+            out = os.path.join(self.dir, f"cam{n}_{k:03d}.ts")
+            cmd = [FFMPEG, "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp",
+                   "-i", src, "-an", "-vf", vf,
+                   # passthrough, not -r: -r would stretch each piece's last frame
+                   # to its real-time length (a 3 s freeze at 100x)
+                   "-fps_mode", "passthrough", "-enc_time_base", f"1/{TL_FPS}",
+                   "-c:v", "libx264", "-preset", "medium", "-crf", TL_CRF,
+                   "-pix_fmt", "yuv420p", "-threads", "2", "-f", "mpegts", out]
+            t0 = time.time()
+            # a camera that stays away is retried quietly, backing off to 30 s
+            try: p = subprocess.Popen(cmd, stderr=subprocess.DEVNULL if fails else None)
+            except Exception as e:
+                print(f"timelapse: {name}: cannot start ffmpeg: {e}"); self.stop_evt.wait(5); continue
+            with self.lock: self.live[name] = t0; self._save()
+            while p.poll() is None and not self._over() and cams_enabled():
+                self.stop_evt.wait(1)
+            _stop_ffmpeg(p)
+            ran = time.time() - t0
+            with self.lock:
+                self.live[name] = None
+                got = os.path.exists(out) and os.path.getsize(out) > 2000
+                if got: self.captured[name] += ran
+                self._save()
+            if got:
+                fails = 0; print(f"timelapse: {name} piece {k} ended after {_span(ran)}")
             else:
-                _tg_reply("🎞 Timelapse finished — the dog never showed up, nothing to upload.")
-        for _nm, path, _k in made:
-            try: _deliver(path, elapsed)
-            finally:
-                try: os.path.exists(path) and os.remove(path)
-                except OSError: pass
-        try: shutil.rmtree(sess_dir, ignore_errors=True)
-        except Exception: pass
-        print("timelapse: done")
+                if not fails: print(f"timelapse: {name}: no picture, retrying until it is back")
+                fails += 1
+            if not self._over(): self.stop_evt.wait(min(30, 3 * fails or 3))
 TL = Timelapse()
 
 def _cam_reachable(ip):
@@ -1351,6 +1540,7 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_:(_shutdown(), sys.exit(0)))
     if CAMS:
         threading.Thread(target=_cam_health_watch, daemon=True).start()
+    TL.recover()                              # a timelapse the last run left behind
     if TG_TOKEN and TG_CHAT:
         threading.Thread(target=_tg_command_loop, daemon=True).start()
         if CAMS:
