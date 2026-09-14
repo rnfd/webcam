@@ -57,13 +57,17 @@ let
   #
   # Page and WHEP signalling go through the tunnel (plain HTTP); the WebRTC media
   # itself cannot — it needs a direct path to this box on 8189. MediaMTX learns
-  # its public address through STUN and advertises it, but the router must
-  # forward 8189 TCP+UDP to ${lanHost} (like 58395/udp for the VPN) or public
-  # viewers see the page and no video.
+  # its public address through STUN and advertises it, and /expose asks the
+  # router to forward 8189 TCP+UDP to ${lanHost} (see routerUrl below).
   tunnelId = "fd428774-b936-4168-9b20-79c18cfca78e";   # services.cloudflared tunnel in configuration.nix
   publicPort = 8090;              # loopback vhost the tunnel ingress points at
   cfZone = "axonpipe.com";
   cfTokenFile = "/etc/cloudflare-ddns.token";  # Zone:DNS:Edit on ${cfZone} (root, 0400), shared with cloudflare-ddns
+  # The router (a Linksys Velop, JNAP API): /expose adds a single-port forward
+  # of 8189 TCP+UDP to ${lanHost} and /close removes it. Needs the admin
+  # password in /etc/cams/router.env (root, 0600) as ROUTER_PASS=...; without
+  # the file the commands still work, minus the forward.
+  routerUrl = "http://192.168.1.1";
   # ----------------------------------------------------
 
   cred = if camUser == "" then "" else "${camUser}:${camPass}@";
@@ -225,6 +229,8 @@ in {
       CF_ZONE = cfZone;
       CF_TUNNEL = tunnelId;
       MTX_API = "http://127.0.0.1:${toString mtxApiPort}";
+      ROUTER_URL = routerUrl;
+      WEBRTC_MEDIA_PORT = "8189";
     };
     serviceConfig = {
       ExecStart = "${python}/bin/python3 ${appPy}";
@@ -244,7 +250,8 @@ in {
       RuntimeDirectoryMode = "0700";
       # Optional secrets (Telegram). Leading "-" = don't fail if the file is absent.
       # Put TELEGRAM_BOT_TOKEN=... and TELEGRAM_CHAT_ID=... in this root-only file.
-      EnvironmentFile = "-/etc/cams/telegram.env";
+      # ROUTER_PASS=... in router.env lets /expose forward the media port itself.
+      EnvironmentFile = [ "-/etc/cams/telegram.env" "-/etc/cams/router.env" ];
       # Cloudflare DNS token for /expose and /close, handed to the dynamic user
       # the same way cloudflare-ddns gets it (the app reads
       # $CREDENTIALS_DIRECTORY/cf-token). The file must exist or the unit fails.
@@ -303,8 +310,8 @@ in {
   };
 
   # Open the ports (LAN + VPN). These merge with your existing firewall config.
-  # 80 (ACME redirect) + 443 (site); 8189 = WebRTC media (for /expose, also
-  # forward 8189 TCP+UDP on the router). 8088/8889/9997 internal.
+  # 80 (ACME redirect) + 443 (site); 8189 = WebRTC media (/expose forwards it
+  # on the router as well). 8088/8889/9997 internal.
   networking.firewall.allowedTCPPorts = [ 80 443 8189 ];
   networking.firewall.allowedUDPPorts = [ 8189 ];
 }

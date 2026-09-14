@@ -61,6 +61,14 @@ LAN_IP    = os.environ.get("LAN_IP")
 CF_ZONE   = os.environ.get("CF_ZONE")
 CF_TUNNEL = os.environ.get("CF_TUNNEL")
 MTX_API   = os.environ.get("MTX_API")                    # e.g. http://127.0.0.1:9997
+# The WebRTC media needs a direct path to this box, which sits behind the
+# router's NAT: /expose forwards MEDIA_PORT (TCP+UDP) to LAN_IP on a Linksys
+# router through its JNAP API and /close removes the rule again. ROUTER_PASS
+# is the router's admin password (root-only env file); unset = no router step.
+ROUTER_URL  = os.environ.get("ROUTER_URL")                # e.g. http://192.168.1.1
+ROUTER_USER = os.environ.get("ROUTER_USER", "admin")
+ROUTER_PASS = os.environ.get("ROUTER_PASS")
+MEDIA_PORT  = int(os.environ.get("WEBRTC_MEDIA_PORT", "8189"))
 CF_TOKEN_FILE = os.environ.get("CF_TOKEN_FILE") or (
     os.path.join(os.environ["CREDENTIALS_DIRECTORY"], "cf-token")
     if os.environ.get("CREDENTIALS_DIRECTORY") else None)
@@ -123,6 +131,49 @@ def _dns_point(public):
         return None
     except Exception as e:
         print(f"dns: could not point {WEB_HOST}: {e}"); return str(e)
+
+def _jnap(action, body=None):
+    """One Linksys JNAP call (HTTP POST, action in a header, JSON in and out)."""
+    import urllib.request, base64
+    auth = base64.b64encode(f"{ROUTER_USER}:{ROUTER_PASS}".encode()).decode()
+    req = urllib.request.Request(ROUTER_URL.rstrip("/") + "/JNAP/", data=json.dumps(body or {}).encode(),
+                                 headers={"X-JNAP-Action": "http://linksys.com/jnap/" + action,
+                                          "X-JNAP-Authorization": "Basic " + auth,
+                                          "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r: res = json.load(r)
+    if res.get("result") != "OK":
+        raise RuntimeError(f"{action.rsplit('/', 1)[-1]} {res.get('result')} {res.get('error', '')}".strip())
+    return res.get("output", {})
+
+def _router_ready(): return bool(ROUTER_URL and ROUTER_PASS and LAN_IP)
+
+def _router_rule(r): return r.get("externalPort") == MEDIA_PORT and r.get("internalServerIPAddress") == LAN_IP
+
+def _router_forward(on):
+    """Add (on) or drop the router's single-port forward of MEDIA_PORT to this box.
+    The API replaces the whole list, so the other rules are read first and written
+    back untouched. Idempotent. Returns None, or a string saying what went wrong."""
+    try:
+        rules = _jnap("firewall/GetSinglePortForwardingRules").get("rules", [])
+        have = [r for r in rules if _router_rule(r)]
+        if on and len(have) == 1 and have[0].get("isEnabled") and have[0].get("protocol") == "Both" \
+                and have[0].get("internalPort") == MEDIA_PORT:
+            return None
+        if not on and not have: return None
+        want = [r for r in rules if not _router_rule(r)]
+        if on: want.append({"isEnabled": True, "externalPort": MEDIA_PORT, "internalPort": MEDIA_PORT,
+                            "protocol": "Both", "internalServerIPAddress": LAN_IP,
+                            "description": "cams webrtc (/expose)"})
+        _jnap("firewall/SetSinglePortForwardingRules", {"rules": want})
+        print(f"router: forward {MEDIA_PORT} -> {LAN_IP} {'added' if on else 'removed'}")
+        return None
+    except Exception as e:
+        print(f"router: could not {'add' if on else 'remove'} the forward: {e}"); return str(e)
+
+def _router_forwarded():
+    """Is the media port forwarded here right now? None when unknown."""
+    try: return any(r.get("isEnabled") for r in _jnap("firewall/GetSinglePortForwardingRules").get("rules", []) if _router_rule(r))
+    except Exception: return None
 
 def _mtx_kick_viewers():
     """Drop every WebRTC viewer. Used by /close: the public ones cannot come back
@@ -954,12 +1005,14 @@ def _help_detail(cmd):
                 "name is pointed at the Cloudflare tunnel instead of the LAN address, which "
                 "takes a minute or so to spread. Anyone with the link can then watch both "
                 "cameras — watch only: no recording, no pan/tilt from the public side. The "
-                "Telegram commands work as before. It stays public until /close.")
+                "video itself needs a direct path to the box, so the router is told to "
+                f"forward port {MEDIA_PORT} here at the same time. The Telegram commands "
+                "work as before. It stays public until /close.")
     if cmd == "close":
         return (f"Points https://{WEB_HOST or 'the site'} back at the LAN address, so it is "
-                "VPN-only again, and disconnects everyone watching (VPN viewers reconnect "
-                "by themselves). The tunnel route is refused the moment /close runs; DNS "
-                "catches up within a minute or so.")
+                "VPN-only again, removes the router's port forward and disconnects everyone "
+                "watching (VPN viewers reconnect by themselves). The tunnel route is refused "
+                "the moment /close runs; DNS catches up within a minute or so.")
     if cmd == "help":
         return "/help lists the commands; /help <command> explains one, e.g. /help timelapse."
     return HELP_TOPICS[cmd][1]
@@ -1054,23 +1107,29 @@ def _tg_handle(text, msg_id=None):
         if why:
             _flag_set("exposed", False)
             _tg_reply(f"⚠️ Could not point DNS at the tunnel: {why}. Still VPN-only."); return
+        # the media path: without the forward the page loads but shows no video
+        rwhy = _router_forward(True) if _router_ready() else "no router password on this box"
         _tg_reply(f"🌍 Public — https://{WEB_HOST} now works without the VPN, view only "
                   "(no recording or pan/tilt from there). DNS takes a minute or so to "
-                  "switch. /close takes it back.")
+                  "switch. /close takes it back."
+                  + (f"\n⚠️ Router: {rwhy} — the page will load but public viewers may get "
+                     f"no video until {MEDIA_PORT} TCP+UDP is forwarded to {LAN_IP}." if rwhy else ""))
     elif text == "/close":
         if not _expose_ready():
             _tg_reply("⚠️ Public access is not set up on this box."); return
         was = exposed_on()
         _flag_set("exposed", False)               # shut the tunnel vhost first, then move DNS
         why = _dns_point(False)
+        rwhy = _router_forward(False) if _router_ready() else None
         kicked = _mtx_kick_viewers()
-        if why:
-            _tg_reply(f"⚠️ The tunnel route is shut, but DNS could not be moved back: {why}. "
-                      "Run /close again in a moment."); return
-        if not was: _tg_reply("🔒 Already VPN-only."); return
-        _tg_reply(f"🔒 Closed — https://{WEB_HOST} is VPN-only again"
+        warn = ((f"\n⚠️ DNS could not be moved back: {why}. Run /close again in a moment." if why else "")
+                + (f"\n⚠️ Router: {rwhy} — port {MEDIA_PORT} may still be forwarded." if rwhy else ""))
+        if not was and not why:
+            _tg_reply("🔒 Already VPN-only." + warn); return
+        _tg_reply((f"🔒 Closed — https://{WEB_HOST} is VPN-only again" if not why
+                   else "🔒 The tunnel route is shut")
                   + (f"; {kicked} viewer{'s' if kicked != 1 else ''} disconnected" if kicked else "")
-                  + ". DNS catches up within a minute or so.")
+                  + (". DNS catches up within a minute or so." if not why else ".") + warn)
     elif text.startswith("/timelapse"):
         arg = text[len("/timelapse"):].strip()
         if arg in ("stop", "off", "cancel", "done", "finish", "now"):

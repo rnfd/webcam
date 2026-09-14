@@ -107,9 +107,12 @@ and `TL_MAX_HOURS` (default 24).
   every WebRTC viewer through the MediaMTX API (VPN viewers reconnect on
   their own). Only the page and the WHEP signalling go through the tunnel —
   the WebRTC media needs a direct path to the box on 8189, so MediaMTX asks a
-  STUN server for its public address and advertises it, and **the router must
-  forward 8189 TCP+UDP to the box** (like the VPN's 58395/udp) or public
-  viewers get the page with no video. `/status` says which mode is on.
+  STUN server for its public address and advertises it, and `/expose` adds a
+  single-port forward of 8189 TCP+UDP to the box on the Linksys router (JNAP
+  API, admin password in `/etc/cams/router.env`); `/close` removes it again.
+  Without that file the commands still work but the forward has to be made by
+  hand, or public viewers get the page with no video. `/status` says which
+  mode is on.
 
 ## Configuration
 
@@ -118,6 +121,8 @@ State (the `/disable`, `/follow` and `/expose` switches) lives in `/var/lib/cams
 Secrets live outside the repo, in root-only files:
 
 - `/etc/cams/telegram.env` — `TELEGRAM_BOT_TOKEN=` and `TELEGRAM_CHAT_ID=`
+- `/etc/cams/router.env` — `ROUTER_PASS=` (Linksys admin password) so `/expose`
+  can forward the WebRTC media port on the router
 - `/etc/cams/rclone.conf` — rclone Google Drive remote named `gdrive`
 - `/etc/cams/acme-cloudflare.env` — `CF_DNS_API_TOKEN=` for the HTTPS cert
 - `/etc/cloudflare-ddns.token` — bare Cloudflare token (Zone:DNS:Edit) that
