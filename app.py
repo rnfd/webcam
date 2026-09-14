@@ -26,6 +26,8 @@ os.makedirs(REC_DIR, exist_ok=True)
 #   disabled  present -> cameras are off the air; the publishers never open an
 #                        RTSP session, so no video leaves the cameras at all
 #   follow    present -> detection alerts go to Telegram
+#   exposed   present -> the site is public (/expose): nginx opens the vhost the
+#                        Cloudflare tunnel lands on; absent, that vhost refuses
 STATE_DIR = os.environ.get("CAMS_STATE",
               os.path.join(os.path.dirname(os.path.abspath(__file__)), "state"))
 
@@ -45,6 +47,100 @@ def _flag_set(name, on):
 
 def cams_enabled(): return not _flag_get("disabled")
 def follow_on():    return _flag_get("follow")
+def exposed_on():   return _flag_get("exposed")
+
+# -------------------- /expose and /close: the site without the VPN --------------------
+# WEB_HOST normally resolves to LAN_IP, reachable only over the LAN or the VPN.
+# /expose repoints that Cloudflare DNS record at the tunnel CF_TUNNEL (a proxied
+# CNAME) and raises the "exposed" flag that opens the tunnel's nginx vhost;
+# /close puts the LAN address back, drops the flag and kicks every WebRTC
+# viewer through the MediaMTX API (VPN viewers reconnect on their own; public
+# ones cannot). The DNS token arrives as a systemd credential.
+WEB_HOST  = os.environ.get("WEB_HOST")
+LAN_IP    = os.environ.get("LAN_IP")
+CF_ZONE   = os.environ.get("CF_ZONE")
+CF_TUNNEL = os.environ.get("CF_TUNNEL")
+MTX_API   = os.environ.get("MTX_API")                    # e.g. http://127.0.0.1:9997
+CF_TOKEN_FILE = os.environ.get("CF_TOKEN_FILE") or (
+    os.path.join(os.environ["CREDENTIALS_DIRECTORY"], "cf-token")
+    if os.environ.get("CREDENTIALS_DIRECTORY") else None)
+
+def _cf_token():
+    try:
+        with open(CF_TOKEN_FILE) as f: return f.read().strip()
+    except (OSError, TypeError): return None
+
+def _expose_ready(): return bool(WEB_HOST and LAN_IP and CF_ZONE and CF_TUNNEL and _cf_token())
+
+def _cf_api(method, path, body=None):
+    import urllib.request, urllib.error
+    req = urllib.request.Request("https://api.cloudflare.com/client/v4" + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Bearer " + _cf_token(),
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r: res = json.load(r)
+    except urllib.error.HTTPError as e:
+        try: res = json.load(e)
+        except Exception: raise RuntimeError(f"Cloudflare HTTP {e.code}") from None
+    if not res.get("success"):
+        raise RuntimeError("; ".join(str(x.get("message", x)) for x in res.get("errors", []))
+                           or "Cloudflare refused")
+    return res["result"]
+
+_CF_ZONE_ID = None
+def _cf_zone_id():
+    global _CF_ZONE_ID
+    if not _CF_ZONE_ID:
+        zones = _cf_api("GET", f"/zones?name={CF_ZONE}")
+        if not zones: raise RuntimeError(f"zone {CF_ZONE} not visible to the token")
+        _CF_ZONE_ID = zones[0]["id"]
+    return _CF_ZONE_ID
+
+def _dns_point(public):
+    """Point WEB_HOST at the tunnel (public) or back at LAN_IP (VPN only).
+    Idempotent. Returns None, or a string saying what went wrong."""
+    want = ({"type": "CNAME", "name": WEB_HOST, "content": f"{CF_TUNNEL}.cfargotunnel.com",
+             "ttl": 1, "proxied": True} if public else
+            {"type": "A", "name": WEB_HOST, "content": LAN_IP, "ttl": 60, "proxied": False})
+    try:
+        zid = _cf_zone_id()
+        recs = [r for r in _cf_api("GET", f"/zones/{zid}/dns_records?name={WEB_HOST}")
+                if r["type"] in ("A", "AAAA", "CNAME")]
+        if len(recs) == 1 and all(recs[0][k] == want[k] for k in ("type", "content", "proxied")):
+            return None
+        for r in recs[1:]:                       # a CNAME cannot share its name with anything
+            _cf_api("DELETE", f"/zones/{zid}/dns_records/{r['id']}")
+        if recs:
+            try: _cf_api("PUT", f"/zones/{zid}/dns_records/{recs[0]['id']}", want)
+            except RuntimeError:                  # some type changes need delete + create
+                _cf_api("DELETE", f"/zones/{zid}/dns_records/{recs[0]['id']}")
+                _cf_api("POST", f"/zones/{zid}/dns_records", want)
+        else:
+            _cf_api("POST", f"/zones/{zid}/dns_records", want)
+        print(f"dns: {WEB_HOST} -> {want['type']} {want['content']}"
+              f"{' (proxied)' if want['proxied'] else ''}")
+        return None
+    except Exception as e:
+        print(f"dns: could not point {WEB_HOST}: {e}"); return str(e)
+
+def _mtx_kick_viewers():
+    """Drop every WebRTC viewer. Used by /close: the public ones cannot come back
+    once the vhost is shut; VPN viewers reconnect by themselves in a few seconds."""
+    import urllib.request
+    if not MTX_API: return 0
+    n = 0
+    try:
+        with urllib.request.urlopen(MTX_API + "/v3/webrtcsessions/list", timeout=5) as r:
+            items = json.load(r).get("items", [])
+        for sess in items:
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    MTX_API + f"/v3/webrtcsessions/kick/{sess['id']}", method="POST"), timeout=5)
+                n += 1
+            except Exception as e: print(f"mediamtx: kick {sess.get('id')} failed: {e}")
+    except Exception as e: print("mediamtx: could not list viewers:", e)
+    return n
 
 def find_ffmpeg():
     if os.environ.get("FFMPEG"): return os.environ["FFMPEG"]
@@ -488,7 +584,7 @@ html,body{margin:0;height:100%;background:#000;color:#eee;font:15px/1.4 -apple-s
 #err{position:fixed;left:8px;right:8px;bottom:70px;color:#f87171;font-size:12px;text-align:center}
 </style></head><body>
 <div class="grid" id="grid"></div>
-<div class="bar"><span id="off" hidden>⏸ cameras off</span>__NAV__<button id="rec"><span id="rlab">● Record</span><span id="rsub" hidden></span></button></div>
+<div class="bar"><span id="off" hidden>⏸ cameras off</span>__NAV__<button id="rec"__RECATTR__><span id="rlab">● Record</span><span id="rsub" hidden></span></button></div>
 <div id="err"></div>
 <script>
 var CAMS=__CAMS__, WHEP_BASE=__WHEP_BASE__,
@@ -681,24 +777,29 @@ _whep_env = os.environ.get("WHEP_URL")
 _whep_base = "''" if _whep_env else ("'http://'+location.hostname+':%d'" % WEBRTC_PORT)
 PAGE = PAGE.replace("__WHEP_BASE__", _whep_base)
 
-def _render(cams, title, nav):
+def _render(cams, title, nav, public=False):
+    # Public (/expose) pages only watch: no record button, no pan/tilt pad.
+    if public: cams = [{**c, "ptz": False} for c in cams]
     return (PAGE.replace("__CAMS__", json.dumps(cams))
                 .replace("__TITLE__", title)
-                .replace("__NAV__", nav)).encode()
+                .replace("__NAV__", nav)
+                .replace("__RECATTR__", " hidden" if public else "")).encode()
 
-def _build_pages():
+def _build_pages(public=False):
     """One page per link: "/" shows every camera, "/1", "/2", ... show one each.
     They are separate links on purpose — open them in two windows, or watch both
-    in one. Every page keeps the record button, which records the composite."""
+    in one. Every page keeps the record button, which records the composite —
+    except the public set, which is view-only."""
     cams = _view_cams()
     # No per-camera links down here: each pane's ⤢ button opens its own page.
-    pages = {"/": _render(cams, "Cameras", "")}
+    pages = {"/": _render(cams, "Cameras", "", public)}
     for i, c in enumerate(cams, 1):
-        pages[f"/{i}"] = _render([c], c["name"], '<span class="nav"><a href="/">← both</a></span>')
+        pages[f"/{i}"] = _render([c], c["name"], '<span class="nav"><a href="/">← both</a></span>', public)
     return pages
 # Built in main(), not here: the pages carry each camera's PTZ capability, and
 # asking the camera for it needs helpers defined further down this file.
 PAGES = {}
+PUBLIC_PAGES = {}   # the same links as served through the tunnel (/expose): watch only
 
 class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
@@ -706,8 +807,13 @@ class H(BaseHTTPRequestHandler):
         b=json.dumps(obj).encode(); self.send_response(code)
         self.send_header("Content-Type","application/json"); self.send_header("Cache-Control","no-store")
         self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    def _public(self):
+        # Set by the nginx vhost the Cloudflare tunnel lands on (/expose); that
+        # vhost also refuses /record and /ptz itself, this is the second lock.
+        return self.headers.get("X-Cams-Public") == "1"
     def do_POST(self):
         p, _, q = self.path.partition("?")
+        if self._public(): self._json({"ok": False, "error": "view only"}, 403); return
         if p=="/record/start": self._json(REC.start()); return
         if p=="/record/stop":  self._json(REC.stop());  return
         if p=="/ptz":
@@ -720,8 +826,9 @@ class H(BaseHTTPRequestHandler):
         self.send_error(404)
     def do_GET(self):
         p=self.path.split("?",1)[0]
-        if p in PAGES:
-            b=PAGES[p]; self.send_response(200)
+        pages = PUBLIC_PAGES if self._public() else PAGES
+        if p in pages:
+            b=pages[p]; self.send_response(200)
             self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(b)))
             self.end_headers(); self.wfile.write(b); return
         if p=="/status": self._json(REC.status()); return
@@ -744,6 +851,8 @@ def _tg_set_commands():
             {"command": "disable",  "description": "Cameras off — nothing is captured"},
             {"command": "follow",   "description": "Alert me on person / pet / motion"},
             {"command": "unfollow", "description": "Stop detection alerts"},
+            {"command": "expose",   "description": "Make the site public — no VPN needed, view only"},
+            {"command": "close",    "description": "Back to VPN only"},
             {"command": "timelapse","description": "e.g. /timelapse 8h 100x — film 8h, play it 100x faster"},
             {"command": "record",   "description": "Start recording"},
             {"command": "stop",     "description": "Stop recording"},
@@ -790,6 +899,8 @@ HELP_TOPICS = {   # command -> (one-liner for the overview, detail for /help <co
                  "motion. Independent of recording — it works whether or not you are "
                  "recording. Needs the cameras on."),
     "unfollow": ("stop those alerts", "Stops the detection clips. Nothing else changes."),
+    "expose":   ("make the site public, no VPN needed", None),   # detail below (quotes the host)
+    "close":    ("back to VPN only", None),
     "record":   ("start recording", None),        # detail filled in below (needs the cap)
     "stop":     ("stop recording",
                  "Stops the recording. The file is finalised, converted to MP4, "
@@ -811,6 +922,7 @@ HELP_TOPICS = {   # command -> (one-liner for the overview, detail for /help <co
 HELP_ALIASES = {"rec": "record", "start": "record", "tl": "timelapse"}
 HELP_GROUPS = [("Cameras", ["enable", "disable"]),
                ("Alerts", ["follow", "unfollow"]),
+               ("Access", ["expose", "close"]),
                ("Recording", ["record", "stop"]),
                ("Timelapse", ["timelapse"]),
                ("Info", ["status", "clear", "help"])]
@@ -837,6 +949,17 @@ def _help_detail(cmd):
                 "when it is back and the pieces are joined. At the end each film goes "
                 "to Google Drive with the link posted here.\n\n"
                 "Examples: /timelapse 8h 100x · /timelapse 20m 10x · /timelapse 2 60x")
+    if cmd == "expose":
+        return (f"Makes https://{WEB_HOST or 'the site'} reachable from anywhere, no VPN: the "
+                "name is pointed at the Cloudflare tunnel instead of the LAN address, which "
+                "takes a minute or so to spread. Anyone with the link can then watch both "
+                "cameras — watch only: no recording, no pan/tilt from the public side. The "
+                "Telegram commands work as before. It stays public until /close.")
+    if cmd == "close":
+        return (f"Points https://{WEB_HOST or 'the site'} back at the LAN address, so it is "
+                "VPN-only again, and disconnects everyone watching (VPN viewers reconnect "
+                "by themselves). The tunnel route is refused the moment /close runs; DNS "
+                "catches up within a minute or so.")
     if cmd == "help":
         return "/help lists the commands; /help <command> explains one, e.g. /help timelapse."
     return HELP_TOPICS[cmd][1]
@@ -858,6 +981,7 @@ def _status_lines():
     st = REC.status()
     return [("📷 Cameras on" if st["enabled"] else "⏸ Cameras off — lenses parked, nothing is captured"),
             ("👁 Following detections" if st["follow"] else "🚫 Not following detections"),
+            (f"🌍 Public — https://{WEB_HOST} needs no VPN (/close)" if exposed_on() else "🔒 VPN only"),
             (f"🔴 Recording {_dur(st['elapsed'])}" if st["recording"] else "⏹ Not recording")] + (
            [_tl_status_line(tl)] if (tl := TL.status())["active"] else [])
 
@@ -919,6 +1043,34 @@ def _tg_handle(text, msg_id=None):
     elif text == "/unfollow":
         _flag_set("follow", False)
         _tg_reply("🚫 Not following detections any more.")
+    elif text == "/expose":
+        if not _expose_ready():
+            _tg_reply("⚠️ Public access is not set up on this box (no host, tunnel or DNS token)."); return
+        if exposed_on() and not _dns_point(True):
+            _tg_reply(f"🌍 Already public — https://{WEB_HOST} works without the VPN. /close takes it back."); return
+        if not _flag_set("exposed", True):        # open the tunnel vhost first, then point DNS at it
+            _tg_reply("⚠️ Could not expose (state dir not writable)."); return
+        why = _dns_point(True)
+        if why:
+            _flag_set("exposed", False)
+            _tg_reply(f"⚠️ Could not point DNS at the tunnel: {why}. Still VPN-only."); return
+        _tg_reply(f"🌍 Public — https://{WEB_HOST} now works without the VPN, view only "
+                  "(no recording or pan/tilt from there). DNS takes a minute or so to "
+                  "switch. /close takes it back.")
+    elif text == "/close":
+        if not _expose_ready():
+            _tg_reply("⚠️ Public access is not set up on this box."); return
+        was = exposed_on()
+        _flag_set("exposed", False)               # shut the tunnel vhost first, then move DNS
+        why = _dns_point(False)
+        kicked = _mtx_kick_viewers()
+        if why:
+            _tg_reply(f"⚠️ The tunnel route is shut, but DNS could not be moved back: {why}. "
+                      "Run /close again in a moment."); return
+        if not was: _tg_reply("🔒 Already VPN-only."); return
+        _tg_reply(f"🔒 Closed — https://{WEB_HOST} is VPN-only again"
+                  + (f"; {kicked} viewer{'s' if kicked != 1 else ''} disconnected" if kicked else "")
+                  + ". DNS catches up within a minute or so.")
     elif text.startswith("/timelapse"):
         arg = text[len("/timelapse"):].strip()
         if arg in ("stop", "off", "cancel", "done", "finish", "now"):
@@ -1616,6 +1768,7 @@ def _cam_health_watch():
 def main():
     ensure_mediamtx()
     PAGES.update(_build_pages())
+    PUBLIC_PAGES.update(_build_pages(public=True))
     atexit.register(_shutdown)
     signal.signal(signal.SIGTERM, lambda *_:(_shutdown(), sys.exit(0)))
     if CAMS:

@@ -45,9 +45,43 @@ let
   webHost = "cam.axonpipe.com";   # the name you browse to (port 80, no custom port)
   webPort = 8088;                 # app backend (fronted by nginx on :80)
   webrtcPort = 8889;
+  mtxApiPort = 9997;              # MediaMTX control API, loopback only (/close kicks viewers)
+
+  # ---- /expose and /close: the site without the VPN ----
+  # Normally ${webHost} resolves to ${lanHost}, which only the LAN and the VPN
+  # can reach. /expose repoints that DNS record at the Cloudflare tunnel below
+  # (a proxied CNAME) and /close puts the LAN address back. The tunnel's ingress
+  # for ${webHost} lands on a second nginx vhost that listens on loopback only
+  # and refuses everything unless the "exposed" switch file exists — so the
+  # tunnel route is dead while closed even before DNS has caught up.
+  #
+  # Page and WHEP signalling go through the tunnel (plain HTTP); the WebRTC media
+  # itself cannot — it needs a direct path to this box on 8189. MediaMTX learns
+  # its public address through STUN and advertises it, but the router must
+  # forward 8189 TCP+UDP to ${lanHost} (like 58395/udp for the VPN) or public
+  # viewers see the page and no video.
+  tunnelId = "fd428774-b936-4168-9b20-79c18cfca78e";   # services.cloudflared tunnel in configuration.nix
+  publicPort = 8090;              # loopback vhost the tunnel ingress points at
+  cfZone = "axonpipe.com";
+  cfTokenFile = "/etc/cloudflare-ddns.token";  # Zone:DNS:Edit on ${cfZone} (root, 0400), shared with cloudflare-ddns
   # ----------------------------------------------------
 
   cred = if camUser == "" then "" else "${camUser}:${camPass}@";
+
+  # "/"           -> the app: "/" both cameras, "/1" and "/2" one each
+  #                  (separate live links), plus /status and /record/*
+  # "/cam1/","/cam2/" -> MediaMTX WebRTC signaling (WHEP), one per camera
+  # WebRTC media still flows directly on 8189 — not proxied.
+  # Shared by the VPN vhost and the tunnel (public) vhost below.
+  camLocations = {
+    "/" = {
+      proxyPass = "http://127.0.0.1:${toString webPort}";
+      proxyWebsockets = true;
+    };
+  } // lib.genAttrs [ "/composite/" "/cam1/" "/cam2/" "/cam1sub/" "/cam2sub/" ] (_: {
+    proxyPass = "http://127.0.0.1:${toString webrtcPort}";
+    proxyWebsockets = true;
+  });
 
   # Per-camera publisher — see cam-publish.sh for what it does. Kept as a file
   # next to this module so local dev (mediamtx.yml) runs the exact same logic;
@@ -75,6 +109,15 @@ let
     webrtcAdditionalHosts: [${lanHost}]
     webrtcLocalUDPAddress: :8189
     webrtcLocalTCPAddress: :8189
+    # Public viewers (/expose) are behind NAT on both ends: STUN lets the server
+    # discover and advertise its public address (the router still has to forward
+    # 8189 here). VPN viewers keep using the LAN candidate above.
+    webrtcICEServers2:
+      - url: stun:stun.l.google.com:19302
+    webrtcTrustedProxies: [127.0.0.1]   # nginx: log the viewer's address, not nginx's
+    # control API, loopback only: /close uses it to drop public viewers
+    api: yes
+    apiAddress: 127.0.0.1:${toString mtxApiPort}
     hls: no
     rtmp: no
     srt: no
@@ -93,6 +136,7 @@ let
           - action: publish
           - action: read
           - action: playback
+          - action: api
     paths:
       # HD: what the page plays by default — the camera's main stream, copied.
       # /timelapse reads it live, so it is not recorded.
@@ -175,6 +219,12 @@ in {
       RCLONE_CONFIG = "/run/cams-app/rclone.conf";   # copied in from /etc/cams below
       GDRIVE_REMOTE = gdriveRemote;
       WHEP_URL = "1";                         # tells the page to use same-origin signaling
+      # --- /expose and /close (see the let block) ---
+      WEB_HOST = webHost;
+      LAN_IP = lanHost;
+      CF_ZONE = cfZone;
+      CF_TUNNEL = tunnelId;
+      MTX_API = "http://127.0.0.1:${toString mtxApiPort}";
     };
     serviceConfig = {
       ExecStart = "${python}/bin/python3 ${appPy}";
@@ -195,14 +245,15 @@ in {
       # Optional secrets (Telegram). Leading "-" = don't fail if the file is absent.
       # Put TELEGRAM_BOT_TOKEN=... and TELEGRAM_CHAT_ID=... in this root-only file.
       EnvironmentFile = "-/etc/cams/telegram.env";
+      # Cloudflare DNS token for /expose and /close, handed to the dynamic user
+      # the same way cloudflare-ddns gets it (the app reads
+      # $CREDENTIALS_DIRECTORY/cf-token). The file must exist or the unit fails.
+      LoadCredential = [ "cf-token:${cfTokenFile}" ];
     };
   };
 
-  # Reverse proxy on :80 so you browse http://${webHost} with no custom port.
-  # "/"           -> the app: "/" both cameras, "/1" and "/2" one each
-  #                  (separate live links), plus /status and /record/*
-  # "/cam1/","/cam2/" -> MediaMTX WebRTC signaling (WHEP), one per camera
-  # WebRTC media still flows directly on 8189 (over the VPN) — not proxied.
+  # Reverse proxy on :80 so you browse http://${webHost} with no custom port
+  # (see camLocations above for what goes where).
   services.nginx = {
     enable = true;
     recommendedProxySettings = true;
@@ -210,32 +261,31 @@ in {
       default = true;                        # also answer bare-IP requests
       useACMEHost = webHost;                 # serve the DNS-01 cert below
       forceSSL = true;                       # redirect http:80 -> https:443
-      locations."/" = {
-        proxyPass = "http://127.0.0.1:${toString webPort}";
-        proxyWebsockets = true;
-      };
-      locations."/composite/" = {
-        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
-        proxyWebsockets = true;
-      };
-      locations."/cam1/" = {
-        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
-        proxyWebsockets = true;
-      };
-      locations."/cam2/" = {
-        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
-        proxyWebsockets = true;
-      };
-      locations."/cam1sub/" = {
-        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
-        proxyWebsockets = true;
-      };
-      locations."/cam2sub/" = {
-        proxyPass = "http://127.0.0.1:${toString webrtcPort}";
-        proxyWebsockets = true;
+      locations = camLocations;
+    };
+    # The same site for the Cloudflare tunnel (/expose). Loopback only, plain
+    # HTTP (Cloudflare terminates TLS at its edge), and shut unless the
+    # "exposed" switch file exists. Public viewers only watch: the record and
+    # pan/tilt endpoints are refused here, and the header tells the app to
+    # serve the page without those controls.
+    virtualHosts."${webHost}-public" = {
+      serverName = webHost;
+      listen = [ { addr = "127.0.0.1"; port = publicPort; } ];
+      extraConfig = ''
+        if (!-f ${stateDir}/exposed) { return 403; }
+      '';
+      locations = camLocations // {
+        "/" = camLocations."/" // { extraConfig = "proxy_set_header X-Cams-Public 1;"; };
+        "~ ^/(record|ptz)" = { return = "403"; };
       };
     };
   };
+  # nginx has to see into the switch directory (0770 root:cams) for the test above.
+  users.users.nginx.extraGroups = [ "cams" ];
+
+  # Tunnel ingress for the site: only reachable while DNS points here (/expose),
+  # and only answered while the switch file exists (vhost above).
+  services.cloudflared.tunnels."${tunnelId}".ingress."${webHost}" = "http://127.0.0.1:${toString publicPort}";
 
   # HTTPS cert via Let's Encrypt DNS-01 (Cloudflare) — works for a private,
   # VPN-only IP with no public exposure. Needs a Cloudflare API token with
@@ -253,7 +303,8 @@ in {
   };
 
   # Open the ports (LAN + VPN). These merge with your existing firewall config.
-  # 80 (ACME redirect) + 443 (site); 8189 = WebRTC media. 8088/8889 internal.
+  # 80 (ACME redirect) + 443 (site); 8189 = WebRTC media (for /expose, also
+  # forward 8189 TCP+UDP on the router). 8088/8889/9997 internal.
   networking.firewall.allowedTCPPorts = [ 80 443 8189 ];
   networking.firewall.allowedUDPPorts = [ 8189 ];
 }

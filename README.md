@@ -95,16 +95,33 @@ and `TL_MAX_HOURS` (default 24).
   bot delete (it notes what it sends in `tg-sent.json`, since a bot cannot read
   chat history). Both switches are files in `/var/lib/cams-state`, shared
   with the MediaMTX service through the `cams` group, so they survive a restart.
+- **Public access:** the site is normally VPN-only — `cam.axonpipe.com` is a
+  plain DNS record pointing at the box's LAN address. `/expose` makes it
+  reachable from anywhere: it repoints that record at the Cloudflare tunnel
+  (a proxied CNAME) and raises a third switch file, `exposed`, which opens a
+  second nginx vhost on loopback that the tunnel's ingress lands on. The vhost
+  refuses everything while the file is absent, so the tunnel route is dead the
+  moment `/close` runs, and DNS follows within a minute. Public viewers only
+  watch: that vhost refuses `/record` and `/ptz`, and the page it serves has no
+  record button or pan/tilt pad. `/close` puts the LAN address back and kicks
+  every WebRTC viewer through the MediaMTX API (VPN viewers reconnect on
+  their own). Only the page and the WHEP signalling go through the tunnel —
+  the WebRTC media needs a direct path to the box on 8189, so MediaMTX asks a
+  STUN server for its public address and advertises it, and **the router must
+  forward 8189 TCP+UDP to the box** (like the VPN's 58395/udp) or public
+  viewers get the page with no video. `/status` says which mode is on.
 
 ## Configuration
 
 Edit the `let` block in `cams.nix` (camera IPs, credentials, streams, host).
-State (the `/disable` and `/follow` switches) lives in `/var/lib/cams-state`.
+State (the `/disable`, `/follow` and `/expose` switches) lives in `/var/lib/cams-state`.
 Secrets live outside the repo, in root-only files:
 
 - `/etc/cams/telegram.env` — `TELEGRAM_BOT_TOKEN=` and `TELEGRAM_CHAT_ID=`
 - `/etc/cams/rclone.conf` — rclone Google Drive remote named `gdrive`
 - `/etc/cams/acme-cloudflare.env` — `CF_DNS_API_TOKEN=` for the HTTPS cert
+- `/etc/cloudflare-ddns.token` — bare Cloudflare token (Zone:DNS:Edit) that
+  `/expose` and `/close` move the DNS record with; shared with the host's DDNS timer
 
 ## Install (NixOS)
 
