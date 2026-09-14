@@ -56,10 +56,14 @@ let
   # tunnel route is dead while closed even before DNS has caught up.
   #
   # Page and WHEP signalling go through the tunnel (plain HTTP); the WebRTC media
-  # itself cannot — it needs a direct path to this box on 8189. MediaMTX learns
-  # its public address through STUN and advertises it, and /expose asks the
-  # router to forward 8189 TCP+UDP to ${lanHost} (see routerUrl below).
+  # itself cannot — it needs a direct path to this box on 8189. MediaMTX
+  # advertises ${publicHost} (the DDNS name the host keeps pointed at its
+  # public IPv4 and IPv6; resolved per session) next to the LAN address, and
+  # /expose asks the router to forward 8189 TCP+UDP to ${lanHost}. Not STUN:
+  # the reflexive candidate it finds comes from a throwaway socket, so it
+  # carries a random port that nothing forwards.
   tunnelId = "fd428774-b936-4168-9b20-79c18cfca78e";   # services.cloudflared tunnel in configuration.nix
+  publicHost = "ssh.axonpipe.com";   # kept current by the cloudflare-ddns timer in configuration.nix
   publicPort = 8090;              # loopback vhost the tunnel ingress points at
   cfZone = "axonpipe.com";
   cfTokenFile = "/etc/cloudflare-ddns.token";  # Zone:DNS:Edit on ${cfZone} (root, 0400), shared with cloudflare-ddns
@@ -110,14 +114,12 @@ let
     rtspTransports: [tcp]
     webrtc: yes
     webrtcAddress: :${toString webrtcPort}
-    webrtcAdditionalHosts: [${lanHost}]
+    # LAN address for VPN viewers; the public name for /expose viewers, who reach
+    # 8189 through the router's forward (IPv4) or directly (IPv6). Resolved per
+    # session, so a changed public address is picked up on its own.
+    webrtcAdditionalHosts: [${lanHost}, ${publicHost}]
     webrtcLocalUDPAddress: :8189
     webrtcLocalTCPAddress: :8189
-    # Public viewers (/expose) are behind NAT on both ends: STUN lets the server
-    # discover and advertise its public address (the router still has to forward
-    # 8189 here). VPN viewers keep using the LAN candidate above.
-    webrtcICEServers2:
-      - url: stun:stun.l.google.com:19302
     webrtcTrustedProxies: [127.0.0.1]   # nginx: log the viewer's address, not nginx's
     # control API, loopback only: /close uses it to drop public viewers
     api: yes

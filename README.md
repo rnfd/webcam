@@ -48,7 +48,12 @@ and `TL_MAX_HOURS` (default 24).
   The panes are time-aligned: each input is stamped with its arrival wall clock
   (`-use_wallclock_as_timestamps 1`, `-copyts`), so the stack pairs frames that
   arrived at the same moment instead of the Nth frame of each RTSP session,
-  which could be seconds apart.
+  which could be seconds apart. If either input ends — a camera's publisher
+  reconnecting, or its OFFLINE placeholder giving way to the real stream — the
+  encode ends with it and restarts a second later on both live inputs. (The
+  `vstack` default is the opposite: keep going with the last frame of the input
+  that stopped, which once left a whole session recorded with a live camera 1
+  over a frozen "CAMERA OFFLINE" card for camera 2.)
 - **Moving the cameras:** both are Reolink E1 Pro, which pan and tilt, so each
   pane carries a ✥ button and a small arrow pad — hold an arrow to move, release
   to stop; on a single-camera page the keyboard arrows do the same. The page only
@@ -58,9 +63,13 @@ and `TL_MAX_HOURS` (default 24).
   a camera spinning.
 - **Recording:** the app stream-copies that composite to an `.mkv` (no re-encode,
   no extra camera load), so live viewing stays per-camera while storage stays
-  combined. Stop finalizes the file, then in the background it
-  remuxes to MP4, uploads to Google Drive (rclone), and posts a link to Telegram
-  with an upload progress bar. Recordings auto-stop after 8 hours.
+  combined. Each time the composite is republished (see above) the copy ends
+  with it, so the recorder writes a session as `.partNN.mkv` files, starting
+  the next part as soon as the path is back; a camera blip costs a few seconds
+  of footage, not the rest of the session. Stop joins the parts into one file
+  (concat demuxer, still no re-encode), then in the background it remuxes to
+  MP4, uploads to Google Drive (rclone), and posts a link to Telegram with an
+  upload progress bar. Recordings auto-stop after 8 hours.
 - **Timelapse:** `/timelapse 8h 100x` films both cameras for 8 hours and plays
   it back 100 times faster — 4m 48s of film per camera. One ffmpeg per camera
   reads the HD stream live and keeps a frame every speed ÷ fps seconds (3.3 s
@@ -106,10 +115,12 @@ and `TL_MAX_HOURS` (default 24).
   record button or pan/tilt pad. `/close` puts the LAN address back and kicks
   every WebRTC viewer through the MediaMTX API (VPN viewers reconnect on
   their own). Only the page and the WHEP signalling go through the tunnel —
-  the WebRTC media needs a direct path to the box on 8189, so MediaMTX asks a
-  STUN server for its public address and advertises it, and `/expose` adds a
-  single-port forward of 8189 TCP+UDP to the box on the Linksys router (JNAP
-  API, admin password in `/etc/cams/router.env`); `/close` removes it again.
+  the WebRTC media needs a direct path to the box on 8189. MediaMTX advertises
+  `ssh.axonpipe.com` (the DDNS name the host keeps pointed at its public IPv4
+  and IPv6, resolved per session) next to the LAN address, and `/expose` opens
+  the way in on the Linksys router (JNAP API, admin password in
+  `/etc/cams/router.env`): a single-port forward of 8189 TCP+UDP to the box
+  and an IPv6 firewall pinhole for the same port; `/close` removes both.
   Without that file the commands still work but the forward has to be made by
   hand, or public viewers get the page with no video. `/status` says which
   mode is on.

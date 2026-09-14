@@ -147,28 +147,62 @@ def _jnap(action, body=None):
 
 def _router_ready(): return bool(ROUTER_URL and ROUTER_PASS and LAN_IP)
 
+ROUTER_DESC = "cams webrtc (/expose)"
 def _router_rule(r): return r.get("externalPort") == MEDIA_PORT and r.get("internalServerIPAddress") == LAN_IP
+def _router_rule6(r): return any(pr.get("firstPort") == MEDIA_PORT for pr in r.get("portRanges", [])) \
+                             and r.get("description", "").startswith("cams webrtc")
+
+def _ipv6_stable():
+    """This box's global, non-temporary IPv6 address — the one the DDNS name's
+    AAAA points at and MediaMTX advertises — or None."""
+    import ipaddress
+    try:
+        for line in open("/proc/net/if_inet6"):
+            addr, _idx, _plen, scope, flags, _name = line.split()
+            if scope == "00" and not int(flags, 16) & 0x01:      # global, not a privacy address
+                return ipaddress.ip_address(int(addr, 16)).compressed
+    except (OSError, ValueError): pass
+    return None
 
 def _router_forward(on):
-    """Add (on) or drop the router's single-port forward of MEDIA_PORT to this box.
-    The API replaces the whole list, so the other rules are read first and written
-    back untouched. Idempotent. Returns None, or a string saying what went wrong."""
+    """Add (on) or drop the router's rules that let the media in: a single-port
+    forward of MEDIA_PORT to this box (IPv4) and a pinhole for the same port to
+    its global IPv6 address. Each API call replaces the whole list, so the other
+    rules are read first and written back untouched. Idempotent. Returns None,
+    or a string saying what went wrong (the two are independent: one failing
+    does not stop the other)."""
+    errs = []
     try:
         rules = _jnap("firewall/GetSinglePortForwardingRules").get("rules", [])
         have = [r for r in rules if _router_rule(r)]
-        if on and len(have) == 1 and have[0].get("isEnabled") and have[0].get("protocol") == "Both" \
-                and have[0].get("internalPort") == MEDIA_PORT:
-            return None
-        if not on and not have: return None
-        want = [r for r in rules if not _router_rule(r)]
-        if on: want.append({"isEnabled": True, "externalPort": MEDIA_PORT, "internalPort": MEDIA_PORT,
-                            "protocol": "Both", "internalServerIPAddress": LAN_IP,
-                            "description": "cams webrtc (/expose)"})
-        _jnap("firewall/SetSinglePortForwardingRules", {"rules": want})
-        print(f"router: forward {MEDIA_PORT} -> {LAN_IP} {'added' if on else 'removed'}")
-        return None
+        ok = (len(have) == 1 and have[0].get("isEnabled") and have[0].get("protocol") == "Both"
+              and have[0].get("internalPort") == MEDIA_PORT) if on else not have
+        if not ok:
+            want = [r for r in rules if not _router_rule(r)]
+            if on: want.append({"isEnabled": True, "externalPort": MEDIA_PORT, "internalPort": MEDIA_PORT,
+                                "protocol": "Both", "internalServerIPAddress": LAN_IP,
+                                "description": ROUTER_DESC})
+            _jnap("firewall/SetSinglePortForwardingRules", {"rules": want})
+            print(f"router: forward {MEDIA_PORT} -> {LAN_IP} {'added' if on else 'removed'}")
     except Exception as e:
-        print(f"router: could not {'add' if on else 'remove'} the forward: {e}"); return str(e)
+        print(f"router: could not {'add' if on else 'remove'} the forward: {e}"); errs.append(str(e))
+    try:
+        v6 = _ipv6_stable() if on else None
+        if on and not v6: raise RuntimeError("no global IPv6 address on this box")
+        rules = _jnap("firewall/GetIPv6FirewallRules").get("rules", [])
+        have = [r for r in rules if _router_rule6(r)]
+        ok = (len(have) == 1 and have[0].get("isEnabled") and have[0].get("ipv6Address") == v6
+              and have[0].get("portRanges") == [{"protocol": "Both", "firstPort": MEDIA_PORT, "lastPort": MEDIA_PORT}]
+              ) if on else not have
+        if not ok:
+            want = [r for r in rules if not _router_rule6(r)]
+            if on: want.append({"isEnabled": True, "description": ROUTER_DESC, "ipv6Address": v6,
+                                "portRanges": [{"protocol": "Both", "firstPort": MEDIA_PORT, "lastPort": MEDIA_PORT}]})
+            _jnap("firewall/SetIPv6FirewallRules", {"rules": want})
+            print(f"router: IPv6 pinhole {MEDIA_PORT} -> {v6} {'added' if on else 'removed'}")
+    except Exception as e:
+        print(f"router: could not {'add' if on else 'remove'} the IPv6 pinhole: {e}"); errs.append(f"IPv6: {e}")
+    return "; ".join(errs) or None
 
 def _router_forwarded():
     """Is the media port forwarded here right now? None when unknown."""
@@ -496,9 +530,8 @@ def _view_cams():
     return [{"path": f"cam{i}", "sd": f"cam{i}sub", "name": nm, "ptz": ptz}
             for i, (nm, ptz) in enumerate(cams, 1)]
 
-def _cam_paths():
-    """Record the single stacked composite (resilient: black pane if a cam is down)."""
-    return [("composite", "Cameras")]
+STALL_TIMEOUT = int(os.environ.get("STALL_TIMEOUT", "10"))   # s; same knob as the publishers
+COMPOSITE_URL = "rtsp://localhost:8554/composite"
 
 def _stop_ffmpeg(p):
     """Ask ffmpeg to finish its file cleanly; force it only if it will not."""
@@ -514,11 +547,40 @@ def _stop_ffmpeg(p):
         try: p.wait(timeout=4)
         except subprocess.TimeoutExpired: p.kill()
 
+def _concat_parts(parts, out):
+    """Join stream-copied parts of one session into a single file. Every part
+    comes from the same compositor command (same codecs, same size), so the
+    concat demuxer can splice them without re-encoding; it offsets each part's
+    timestamps by the previous ones, so the gaps between parts simply vanish."""
+    if len(parts) == 1:
+        os.replace(parts[0], out); return
+    lst = out + ".parts.txt"
+    with open(lst, "w") as f:
+        for part in parts: f.write("file '%s'\n" % part.replace("'", r"'\''"))
+    try:
+        subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-nostdin",
+                        "-f", "concat", "-safe", "0", "-i", lst, "-map", "0", "-c", "copy", out],
+                       check=True, timeout=1800)
+    finally:
+        try: os.remove(lst)
+        except OSError: pass
+    for part in parts:
+        try: os.remove(part)
+        except OSError: pass
+
 class Recorder:
-    """Records each camera independently, so one camera failing never stops the
-    others. A session is 'recording' while any per-camera recorder is alive."""
+    """Records the stacked composite path into one file per session.
+
+    A session is a supervisor thread that keeps an ffmpeg stream-copying the
+    composite into part files. The composite is republished whenever a camera
+    blinks (the compositor ends its encode the moment an input drops and comes
+    back a few seconds later), and an ffmpeg reading it simply ends with it —
+    so the thread starts a new part as soon as the path is back, and stop()
+    splices the parts into the final file. Before this, one ffmpeg meant the
+    recording silently ended the first time the composite went away; and
+    before the compositor was fixed, it froze one camera instead."""
     def __init__(self):
-        self.lock = threading.Lock(); self.sessions = []; self.started = None; self._timer = None
+        self.lock = threading.Lock(); self.sess = None; self._timer = None
     def _arm_cap(self):
         self._disarm_cap()
         self._timer = threading.Timer(MAX_REC_SECONDS, self._auto_stop)
@@ -529,58 +591,102 @@ class Recorder:
             except Exception: pass
             self._timer = None
     def _alive(self):
-        return any(s["proc"] and s["proc"].poll() is None for s in self.sessions)
+        return bool(self.sess) and not self.sess["stop"].is_set()
     def _auto_stop(self):
         if self._alive():
             print(f"recorder: reached {MAX_REC_SECONDS}s cap, auto-stopping"); self.stop()
     def _state(self):
-        n = sum(1 for s in self.sessions if s["proc"] and s["proc"].poll() is None)
-        rec = n > 0
-        return {"recording": rec, "cams": n,
-                "elapsed": int(time.time()-self.started) if (rec and self.started) else 0,
+        rec = self._alive()
+        p = self.sess["proc"] if rec else None
+        return {"recording": rec, "cams": 1 if (p and p.poll() is None) else 0,
+                "elapsed": int(time.time()-self.sess["started"]) if rec else 0,
                 "enabled": cams_enabled(), "follow": follow_on()}
     def status(self):
         with self.lock:
             return self._state()
+    def _run(self, s):
+        """One part after another until stop() — each part is one ffmpeg's life."""
+        while not s["stop"].is_set():
+            n = len(s["parts"]) + 1
+            part = os.path.join(REC_DIR, f"rec_{s['ts']}_composite.part{n:02d}.mkv")
+            cmd = [FFMPEG, "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp",
+                   "-timeout", str(STALL_TIMEOUT * 1000000),   # a stalled composite ends the part
+                   "-i", COMPOSITE_URL, "-map", "0", "-c", "copy",
+                   "-f", "matroska", part]
+            # stderr goes to a file, not a pipe: a pipe nobody drains would block
+            # ffmpeg once it filled. While the composite is away every attempt
+            # fails with a 404 — that is expected and stays out of the log.
+            log = part + ".log"
+            try:
+                with open(log, "w") as err:
+                    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=err)
+            except Exception as e:
+                print("recorder: cannot start ffmpeg:", e); s["stop"].wait(2); continue
+            with self.lock:
+                if s["stop"].is_set(): p.kill()        # stop() raced us; nothing recorded yet
+                s["proc"] = p
+            p.wait()
+            with self.lock: s["proc"] = None
+            try:
+                with open(log) as f: err = f.read().strip()
+                os.remove(log)
+            except OSError: err = ""
+            if os.path.exists(part) and os.path.getsize(part) > 2000:
+                s["parts"].append(part)
+                if err: print(f"recorder: part {n}:", err)
+                if not s["stop"].is_set():
+                    print(f"recorder: composite went away after part {n}; waiting for it")
+            else:
+                try: os.path.exists(part) and os.remove(part)
+                except OSError: pass
+                if err and "404" not in err: print("recorder: could not open composite:", err)
+            s["stop"].wait(1)                          # the compositor retries every second too
     def start(self):
         with self.lock:
             if self._alive(): return self._state()
             if not cams_enabled():
                 return {"recording": False, "cams": 0, "elapsed": 0,
                         "error": "cameras are disabled"}
-            ts = time.strftime("%Y%m%d_%H%M%S"); self.sessions = []
-            for path, name in _cam_paths():
-                mkv = os.path.join(REC_DIR, f"rec_{ts}_{path}.mkv")
-                cmd = [FFMPEG, "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp",
-                       "-i", f"rtsp://localhost:8554/{path}", "-map", "0", "-c", "copy",
-                       "-f", "matroska", mkv]
-                self.sessions.append({"path": path, "name": name, "mkv": mkv,
-                                      "proc": subprocess.Popen(cmd, stdin=subprocess.PIPE)})
-            time.sleep(1.5)                                   # let them connect
-            for s in list(self.sessions):                    # drop cameras that didn't start
-                if s["proc"].poll() is not None:
-                    try: os.path.exists(s["mkv"]) and os.path.getsize(s["mkv"]) == 0 and os.remove(s["mkv"])
-                    except OSError: pass
-                    self.sessions.remove(s)
-            if not self.sessions:
-                self.started = None
-                return {"recording": False, "cams": 0, "elapsed": 0, "error": "no cameras available"}
-            self.started = time.time(); self._arm_cap()
-            return self._state()
-    def stop(self):
+            s = {"ts": time.strftime("%Y%m%d_%H%M%S"), "parts": [], "proc": None,
+                 "stop": threading.Event(), "started": time.time()}
+            s["thread"] = threading.Thread(target=self._run, args=(s,), daemon=True)
+            self.sess = s; s["thread"].start()
+        # Report a start only once the composite is actually being written.
+        for _ in range(8):
+            time.sleep(0.5)
+            with self.lock:
+                if self.sess is not s: return self._state()   # stopped meanwhile
+                p = s["proc"]
+                if p and p.poll() is None:
+                    s["started"] = time.time(); self._arm_cap()
+                    return self._state()
+        self.stop(finish=False)
+        return {"recording": False, "cams": 0, "elapsed": 0, "error": "no cameras available"}
+    def stop(self, finish=True):
         with self.lock:
             self._disarm_cap()
-            sess = self.sessions; st = self.started
-            self.sessions = []; self.started = None
-        if not sess: return {"recording": False, "cams": 0, "elapsed": 0}
-        elapsed = int(time.time()-st) if st else 0
-        for s in sess:
-            _stop_ffmpeg(s["proc"])
-            # upload each camera's file (if it captured anything)
-            if _any_sink() and os.path.exists(s["mkv"]) and os.path.getsize(s["mkv"]) > 2000:
-                threading.Thread(target=_post_record, args=(s["mkv"], elapsed),
-                                 daemon=True).start()
+            s = self.sess; self.sess = None
+            if s: s["stop"].set()
+        if not s: return {"recording": False, "cams": 0, "elapsed": 0}
+        elapsed = int(time.time()-s["started"])
+        with self.lock: p = s["proc"]
+        _stop_ffmpeg(p)
+        s["thread"].join(30)
+        if finish and s["parts"]:
+            threading.Thread(target=self._finish, args=(s, elapsed), daemon=True).start()
+        else:
+            for part in s["parts"]:
+                try: os.remove(part)
+                except OSError: pass
         return {"recording": False, "cams": 0, "elapsed": 0}
+    def _finish(self, s, elapsed):
+        mkv = os.path.join(REC_DIR, f"rec_{s['ts']}_composite.mkv")
+        try: _concat_parts(s["parts"], mkv)
+        except Exception as e:
+            print(f"recorder: could not join {len(s['parts'])} parts, leaving them as they are:", e)
+            return
+        if _any_sink() and os.path.exists(mkv) and os.path.getsize(mkv) > 2000:
+            _post_record(mkv, elapsed)
 REC = Recorder()
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
